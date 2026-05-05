@@ -1,0 +1,16 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+
+# direnv / nix
+/.envrc
+/.direnv/
+
+# Editor scratch
+*.swp
+*~
+
+# Local secrets
+.env
+.env.local

@@ -325,27 +325,46 @@ fn flatten_fields(
             ],
         });
 
-        match field.field_type.as_ref() {
-            Type::Struct(struct_type) => flatten_fields(
-                struct_type.fields(),
-                Some(&path),
-                identifier_ids,
-                identifier_fields,
-                rows,
-            ),
-            Type::List(list_type) => {
-                if let Type::Struct(struct_type) = list_type.element_field.field_type.as_ref() {
-                    flatten_fields(
-                        struct_type.fields(),
-                        Some(&format!("{path}[]")),
-                        identifier_ids,
-                        identifier_fields,
-                        rows,
-                    );
-                }
-            }
-            Type::Primitive(_) | Type::Map(_) => {}
-        }
+        flatten_nested_type(
+            &field.field_type,
+            &path,
+            identifier_ids,
+            identifier_fields,
+            rows,
+        );
+    }
+}
+
+fn flatten_nested_type(
+    field_type: &Type,
+    path: &str,
+    identifier_ids: &HashSet<i32>,
+    identifier_fields: &mut Vec<String>,
+    rows: &mut Vec<Row>,
+) {
+    match field_type {
+        Type::Struct(struct_type) => flatten_fields(
+            struct_type.fields(),
+            Some(path),
+            identifier_ids,
+            identifier_fields,
+            rows,
+        ),
+        Type::List(list_type) => flatten_nested_type(
+            &list_type.element_field.field_type,
+            &format!("{path}[]"),
+            identifier_ids,
+            identifier_fields,
+            rows,
+        ),
+        Type::Map(map_type) => flatten_nested_type(
+            &map_type.value_field.field_type,
+            &format!("{path}{{}}"),
+            identifier_ids,
+            identifier_fields,
+            rows,
+        ),
+        Type::Primitive(_) => {}
     }
 }
 
@@ -364,7 +383,9 @@ fn type_summary(field_type: &Type) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
+    use crate::spec::{
+        ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type,
+    };
     use time::OffsetDateTime;
 
     use super::{Block, Cell, DocumentValue, schema_document};
@@ -374,55 +395,93 @@ mod tests {
             .with_schema_id(3)
             .with_identifier_field_ids([1])
             .with_fields([
-                NestedField::required(1, "org_id", Type::Primitive(PrimitiveType::Long)).into(),
-                NestedField::optional(
-                    2,
-                    "metadata",
-                    Type::Struct(StructType::new(vec![
-                        NestedField::optional(
-                            3,
-                            "labels",
-                            Type::Map(MapType::new(
-                                NestedField::map_key_element(
-                                    4,
-                                    Type::Primitive(PrimitiveType::String),
-                                )
-                                .into(),
-                                NestedField::map_value_element(
-                                    5,
-                                    Type::Primitive(PrimitiveType::String),
-                                    false,
-                                )
-                                .into(),
-                            )),
-                        )
-                        .into(),
-                    ])),
-                )
-                .into(),
-                NestedField::optional(
-                    6,
-                    "containers",
-                    Type::List(ListType::new(
-                        NestedField::list_element(
-                            7,
-                            Type::Struct(StructType::new(vec![
-                                NestedField::optional(
-                                    8,
-                                    "name",
-                                    Type::Primitive(PrimitiveType::String),
-                                )
-                                .into(),
-                            ])),
-                            false,
-                        )
-                        .into(),
-                    )),
-                )
-                .into(),
+                org_id_field(),
+                metadata_field(),
+                containers_field(),
+                properties_field(),
+                events_field(),
             ])
             .build()
             .expect("valid schema")
+    }
+
+    fn org_id_field() -> NestedFieldRef {
+        NestedField::required(1, "org_id", Type::Primitive(PrimitiveType::Long)).into()
+    }
+
+    fn metadata_field() -> NestedFieldRef {
+        NestedField::optional(
+            2,
+            "metadata",
+            Type::Struct(StructType::new(vec![
+                NestedField::optional(
+                    3,
+                    "labels",
+                    map_type(4, Type::Primitive(PrimitiveType::String)),
+                )
+                .into(),
+            ])),
+        )
+        .into()
+    }
+
+    fn containers_field() -> NestedFieldRef {
+        NestedField::optional(
+            6,
+            "containers",
+            Type::List(ListType::new(
+                NestedField::list_element(
+                    7,
+                    Type::Struct(StructType::new(vec![string_field(8, "name")])),
+                    false,
+                )
+                .into(),
+            )),
+        )
+        .into()
+    }
+
+    fn properties_field() -> NestedFieldRef {
+        NestedField::optional(
+            9,
+            "properties",
+            map_type(
+                10,
+                Type::Struct(StructType::new(vec![string_field(12, "value")])),
+            ),
+        )
+        .into()
+    }
+
+    fn events_field() -> NestedFieldRef {
+        NestedField::optional(
+            13,
+            "events",
+            Type::List(ListType::new(
+                NestedField::list_element(
+                    14,
+                    map_type(
+                        15,
+                        Type::Struct(StructType::new(vec![string_field(17, "kind")])),
+                    ),
+                    false,
+                )
+                .into(),
+            )),
+        )
+        .into()
+    }
+
+    fn map_type(key_field_id: i32, value_type: Type) -> Type {
+        Type::Map(MapType::new(
+            NestedField::map_key_element(key_field_id, Type::Primitive(PrimitiveType::String))
+                .into(),
+            NestedField::map_value_element(key_field_id + 1, value_type, false).into(),
+        ))
+    }
+
+    fn string_field(id: i32, name: &'static str) -> NestedFieldRef {
+        NestedField::optional(id, name, Type::Primitive(PrimitiveType::String)).into()
     }
 
     #[test]
@@ -454,12 +513,12 @@ mod tests {
             properties[3].value
         );
         assert_eq!("Top-level field count", properties[4].label);
-        assert_eq!(Cell::value(DocumentValue::Count(3)), properties[4].value);
+        assert_eq!(Cell::value(DocumentValue::Count(5)), properties[4].value);
         assert_eq!(
             "Total field count including nested fields",
             properties[5].label
         );
-        assert_eq!(Cell::value(DocumentValue::Count(5)), properties[5].value);
+        assert_eq!(Cell::value(DocumentValue::Count(9)), properties[5].value);
 
         let Block::Section(section) = &document.blocks[1] else {
             panic!("second block should be a section");
@@ -497,6 +556,24 @@ mod tests {
                 Cell::value(DocumentValue::Number(8)),
             ],
             table.rows[4].cells
+        );
+        assert_eq!(
+            vec![
+                Cell::code("properties{}.value"),
+                Cell::code("string"),
+                Cell::value(DocumentValue::Bool(false)),
+                Cell::value(DocumentValue::Number(12)),
+            ],
+            table.rows[6].cells
+        );
+        assert_eq!(
+            vec![
+                Cell::code("events[]{}.kind"),
+                Cell::code("string"),
+                Cell::value(DocumentValue::Bool(false)),
+                Cell::value(DocumentValue::Number(17)),
+            ],
+            table.rows[8].cells
         );
     }
 }

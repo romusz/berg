@@ -16,6 +16,18 @@ pub enum BergError {
     #[error("application name cannot be empty")]
     EmptyAppName,
 
+    /// The catalog URI required to contact an Iceberg REST catalog was missing.
+    #[error("catalog URI is required; pass --catalog-uri or set BERG_CATALOG_URI")]
+    MissingCatalogUri,
+
+    /// A table identifier could not be parsed.
+    #[error("invalid table identifier `{value}`: expected catalog.namespace.table")]
+    InvalidTableIdentifier { value: String },
+
+    /// A catalog property could not be parsed.
+    #[error("invalid catalog property `{value}`: expected key=value")]
+    InvalidCatalogProperty { value: String },
+
     /// An error originating from `iceberg-rust`.
     #[error(transparent)]
     Iceberg(#[from] iceberg::Error),

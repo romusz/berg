@@ -372,6 +372,7 @@ dependencies = [
  "anyhow",
  "berg-core",
  "clap",
+ "time",
  "tokio",
 ]
 
@@ -383,6 +384,7 @@ dependencies = [
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
  "thiserror 2.0.18",
+ "time",
  "tokio",
 ]
 

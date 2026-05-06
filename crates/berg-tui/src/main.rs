@@ -2,6 +2,7 @@ use std::{io, time::Duration};
 
 use anyhow::Context;
 use crossterm::{
+    cursor::Show,
     event::{self, Event, KeyCode},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -14,33 +15,52 @@ use ratatui::{
 
 type TerminalHandle = Terminal<CrosstermBackend<io::Stdout>>;
 
+/// `RAII` guard that restores the terminal on drop: leaves the alternate
+/// screen, shows the cursor, and disables raw mode.
+///
+/// Constructed *after* `enable_raw_mode()` succeeds, so a partial-init
+/// failure (e.g., entering the alternate screen fails) still triggers
+/// cleanup when the guard unwinds.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> anyhow::Result<Self> {
+        install_panic_hook();
+        enable_raw_mode().context("enable raw mode")?;
+        // Guard now exists; any subsequent failure unwinds through Drop.
+        let guard = Self;
+        execute!(io::stdout(), EnterAlternateScreen).context("enter alternate screen")?;
+        Ok(guard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+fn install_panic_hook() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        restore_terminal();
+        hook(panic_info);
+    }));
+}
+
+fn restore_terminal() {
+    // Best-effort cleanup; errors are ignored because we may already be
+    // unwinding from another error or panic. Raw mode is disabled first because
+    // it has more side effects than leaving the alternate screen.
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+}
+
 fn main() -> anyhow::Result<()> {
-    let mut terminal = init_terminal()?;
-    let result = run(&mut terminal);
-    let restore_result = restore_terminal(&mut terminal);
-
-    result?;
-    restore_result?;
-
-    Ok(())
-}
-
-fn init_terminal() -> anyhow::Result<TerminalHandle> {
-    enable_raw_mode().context("enable raw mode")?;
-
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
-
-    let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).context("create terminal")
-}
-
-fn restore_terminal(terminal: &mut TerminalHandle) -> anyhow::Result<()> {
-    disable_raw_mode().context("disable raw mode")?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).context("leave alternate screen")?;
-    terminal.show_cursor().context("show cursor")?;
-
-    Ok(())
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).context("create terminal")?;
+    run(&mut terminal)
 }
 
 fn run(terminal: &mut TerminalHandle) -> anyhow::Result<()> {

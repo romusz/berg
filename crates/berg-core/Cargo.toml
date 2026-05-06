@@ -7,11 +7,15 @@ license.workspace = true
 readme.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description.workspace = true
 
 [dependencies]
 iceberg.workspace = true
+iceberg-catalog-rest.workspace = true
+iceberg-storage-opendal.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

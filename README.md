@@ -11,11 +11,16 @@ Shared application code lives in `berg-core`.
 
 This project tracks the latest stable Rust release. The declared MSRV is `1.92` (driven by `iceberg-rust`); CI verifies both MSRV and stable on every change.
 
+These commands mirror CI exactly:
+
 ```sh
-cargo build --workspace --all-targets
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --all-targets --locked
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
 ```
+
+`--locked` rejects builds when `Cargo.lock` is out of date. After editing `Cargo.toml`, run the same command without `--locked` once to refresh the lockfile, then commit both files together.
 
 Run the CLI:
 

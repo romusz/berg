@@ -5,10 +5,9 @@
 //!
 //! ## Iceberg surface
 //!
-//! `berg-core` is the deliberate re-export point for the subset of
-//! `iceberg-rust` that frontends are expected to consume directly. Frontends
-//! depend on `berg-core`, not on `iceberg`. See the project rationale section
-//! "Abstraction boundary: operations yes, types no" for the reasoning.
+//! `berg-core` wraps iceberg's *operations* and exposes its *types*.
+//! Frontends depend on `berg-core` and consume Iceberg spec types via the
+//! re-exports below; they do not declare `iceberg` as a direct dependency.
 
 pub mod engine;
 pub mod error;

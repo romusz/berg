@@ -7,7 +7,7 @@ use berg_core::engine::{
     QualifiedTableIdent, RestCatalogConfig, load_current_schema, parse_catalog_property,
 };
 use berg_core::view::{Block, Cell, Document, DocumentValue, List, ListKind, schema_document};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -24,32 +24,67 @@ struct Cli {
 #[derive(Debug, Args)]
 struct CatalogArgs {
     /// Iceberg REST catalog base URI. Overrides `BERG_CATALOG_URI`.
-    #[arg(long = "catalog-uri", value_name = "URI", global = true)]
+    #[arg(
+        long = "catalog-uri",
+        value_name = "URI",
+        global = true,
+        help_heading = "Global catalog options"
+    )]
     uri: Option<String>,
 
     /// REST catalog prefix. Defaults to the catalog segment in the table ID.
     /// Overrides `BERG_CATALOG_PREFIX`.
-    #[arg(long = "catalog-prefix", value_name = "PREFIX", global = true)]
+    #[arg(
+        long = "catalog-prefix",
+        value_name = "PREFIX",
+        global = true,
+        help_heading = "Global catalog options"
+    )]
     prefix: Option<String>,
 
     /// REST catalog warehouse. Overrides `BERG_CATALOG_WAREHOUSE`.
-    #[arg(long = "catalog-warehouse", value_name = "WAREHOUSE", global = true)]
+    #[arg(
+        long = "catalog-warehouse",
+        value_name = "WAREHOUSE",
+        global = true,
+        help_heading = "Global catalog options"
+    )]
     warehouse: Option<String>,
 
     /// REST catalog bearer token. Overrides `BERG_CATALOG_TOKEN`.
-    #[arg(long = "catalog-token", value_name = "TOKEN", global = true)]
+    #[arg(
+        long = "catalog-token",
+        value_name = "TOKEN",
+        global = true,
+        help_heading = "Global catalog options"
+    )]
     token: Option<String>,
 
     /// REST catalog OAuth credential. Overrides `BERG_CATALOG_CREDENTIAL`.
-    #[arg(long = "catalog-credential", value_name = "CREDENTIAL", global = true)]
+    #[arg(
+        long = "catalog-credential",
+        value_name = "CREDENTIAL",
+        global = true,
+        help_heading = "Global catalog options"
+    )]
     credential: Option<String>,
 
     /// Additional REST catalog header as name=value. Can be repeated.
-    #[arg(long = "catalog-header", value_name = "NAME=VALUE", global = true)]
+    #[arg(
+        long = "catalog-header",
+        value_name = "NAME=VALUE",
+        global = true,
+        help_heading = "Global catalog options"
+    )]
     headers: Vec<String>,
 
     /// Additional REST catalog property as key=value. Can be repeated.
-    #[arg(long = "catalog-property", value_name = "KEY=VALUE", global = true)]
+    #[arg(
+        long = "catalog-property",
+        value_name = "KEY=VALUE",
+        global = true,
+        help_heading = "Global catalog options"
+    )]
     properties: Vec<String>,
 }
 
@@ -75,6 +110,31 @@ enum SchemaCommands {
 struct CurrentSchemaArgs {
     /// Fully-qualified table ID: catalog.namespace.table.
     table: String,
+
+    #[command(flatten)]
+    output: DocumentOutputArgs,
+}
+
+#[derive(Debug, Args)]
+struct DocumentOutputArgs {
+    /// Output format for document-producing commands.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "markdown",
+        help_heading = "Output options"
+    )]
+    format: DocumentFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DocumentFormat {
+    /// Render as GitHub-flavored Markdown.
+    Markdown,
+    /// Render the semantic document AST using Rust debug formatting.
+    Ast,
+    /// Render as JSON. Reserved for future implementation.
+    Json,
 }
 
 #[tokio::main]
@@ -134,7 +194,7 @@ async fn print_current_schema(
         schema,
     );
 
-    print!("{}", render_document_markdown(&document));
+    print!("{}", render_document(&document, args.output.format)?);
 
     Ok(())
 }
@@ -206,6 +266,14 @@ fn parse_header_property(value: &str) -> anyhow::Result<(String, String)> {
     let (key, value) = parse_catalog_property(value)?;
 
     Ok((format!("header.{key}"), value))
+}
+
+fn render_document(document: &Document, format: DocumentFormat) -> anyhow::Result<String> {
+    match format {
+        DocumentFormat::Markdown => Ok(render_document_markdown(document)),
+        DocumentFormat::Ast => Ok(format!("{document:#?}\n")),
+        DocumentFormat::Json => Err(anyhow!("JSON document rendering is not implemented yet")),
+    }
 }
 
 fn render_document_markdown(document: &Document) -> String {
@@ -410,7 +478,7 @@ mod tests {
         Block, Document, List, ListItem, ListKind, Property, Row, Section, Table,
     };
 
-    use super::{Cell, DocumentValue, render_document_markdown};
+    use super::{Cell, DocumentFormat, DocumentValue, render_document, render_document_markdown};
 
     #[test]
     fn renders_document_as_markdown() {
@@ -501,5 +569,30 @@ mod tests {
         assert!(markdown.contains("1. Load table metadata"));
         assert!(markdown.contains("2. Derive schema view"));
         assert!(markdown.contains("   - Flatten nested fields"));
+    }
+
+    #[test]
+    fn renders_document_as_debug_ast() {
+        let document = Document {
+            title: Cell::text("Schema"),
+            blocks: vec![Block::Paragraph(Cell::text("details"))],
+        };
+
+        let ast = render_document(&document, DocumentFormat::Ast).expect("AST should render");
+
+        assert!(ast.contains("Document {"));
+        assert!(ast.contains("Paragraph("));
+    }
+
+    #[test]
+    fn rejects_unimplemented_json_format() {
+        let document = Document {
+            title: Cell::text("Schema"),
+            blocks: Vec::new(),
+        };
+
+        let err = render_document(&document, DocumentFormat::Json).expect_err("JSON is deferred");
+
+        assert!(err.to_string().contains("not implemented"));
     }
 }

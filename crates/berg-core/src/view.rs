@@ -31,61 +31,152 @@
 //! spec type already conveys what the frontend needs, frontends consume
 //! [`crate::spec`] types directly.
 //!
+use std::borrow::Borrow;
 use std::collections::HashSet;
 
-use crate::spec::{NestedFieldRef, Schema, SchemaRef, Type};
+use crate::spec::{NestedFieldRef, Schema, Type};
 use time::OffsetDateTime;
 
-/// Presentation-neutral report document shared by frontends.
+/// Semantic document AST shared by frontends.
+///
+/// This is intentionally close to a document model rather than a report model:
+/// frontends can render it as GitHub-flavored Markdown, terminal widgets, HTML,
+/// or another medium without recomputing Iceberg-derived semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportDocument {
-    /// Report title.
-    pub title: ReportTitle,
-    /// Ordered report metadata properties.
-    pub properties: Vec<ReportProperty>,
-    /// Ordered report tables.
-    pub tables: Vec<ReportTable>,
+pub struct Document {
+    /// Top-level document title.
+    pub title: Cell,
+    /// Ordered document blocks.
+    pub blocks: Vec<Block>,
 }
 
-/// Presentation-neutral report title.
+/// Block-level semantic content.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportTitle {
-    /// Title label, such as `Schema`.
-    pub label: &'static str,
-    /// Subject of the title.
-    pub subject: ReportValue,
+pub enum Block {
+    /// Paragraph-like inline content.
+    Paragraph(Cell),
+    /// Ordered key/value properties.
+    Properties(Vec<Property>),
+    /// Tabular content.
+    Table(Table),
+    /// Nested section. Markdown renderers should increase heading depth for
+    /// each nested section.
+    Section(Section),
+    /// Ordered or unordered list.
+    List(List),
+    /// Fenced code block.
+    FencedCode(FencedCode),
+    /// Horizontal rule / thematic break.
+    ThematicBreak,
 }
 
-/// Presentation-neutral report metadata property.
+/// Nested section with its own ordered blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportProperty {
+pub struct Section {
+    /// Section heading.
+    pub title: Cell,
+    /// Section body blocks.
+    pub blocks: Vec<Block>,
+}
+
+/// Ordered or unordered list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct List {
+    /// List marker style.
+    pub kind: ListKind,
+    /// Ordered list items.
+    pub items: Vec<ListItem>,
+}
+
+/// List marker style.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListKind {
+    /// Bullet list.
+    Unordered,
+    /// Numbered list.
+    Ordered {
+        /// First rendered number.
+        start: usize,
+    },
+}
+
+/// One list item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListItem {
+    /// Item body blocks.
+    pub blocks: Vec<Block>,
+}
+
+/// Semantic key/value property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Property {
     /// Property label.
-    pub label: &'static str,
+    pub label: String,
     /// Property value.
-    pub value: ReportValue,
+    pub value: Cell,
 }
 
-/// Presentation-neutral report table.
+/// Semantic table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportTable {
-    /// Table title.
-    pub title: &'static str,
+pub struct Table {
     /// Ordered column labels.
-    pub columns: Vec<&'static str>,
+    pub columns: Vec<Cell>,
     /// Ordered rows.
-    pub rows: Vec<ReportRow>,
+    pub rows: Vec<Row>,
 }
 
-/// Presentation-neutral report row.
+/// Semantic table row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportRow {
+pub struct Row {
     /// Ordered row cells.
-    pub cells: Vec<ReportValue>,
+    pub cells: Vec<Cell>,
 }
 
-/// Semantic report value that each frontend renders in its own medium.
+/// Inline content container used by titles, paragraphs, properties, lists, and tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReportValue {
+pub struct Cell {
+    /// Ordered inline values.
+    pub values: Vec<DocumentValue>,
+}
+
+impl Cell {
+    /// Build a cell from inline values.
+    #[must_use]
+    pub fn new(values: Vec<DocumentValue>) -> Self {
+        Self { values }
+    }
+
+    /// Build a plain-text cell.
+    #[must_use]
+    pub fn text(value: impl Into<String>) -> Self {
+        Self::new(vec![DocumentValue::Text(value.into())])
+    }
+
+    /// Build a code-like cell.
+    #[must_use]
+    pub fn code(value: impl Into<String>) -> Self {
+        Self::new(vec![DocumentValue::Code(value.into())])
+    }
+
+    /// Build a cell containing a single semantic value.
+    #[must_use]
+    pub fn value(value: DocumentValue) -> Self {
+        Self::new(vec![value])
+    }
+}
+
+/// Fenced code block content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FencedCode {
+    /// Optional language tag.
+    pub language: Option<String>,
+    /// Code body.
+    pub code: String,
+}
+
+/// Semantic inline value that each frontend renders in its own medium.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentValue {
     /// Plain text.
     Text(String),
     /// Code-like text, such as field paths, type names, or identifiers.
@@ -94,172 +185,163 @@ pub enum ReportValue {
     Uri(String),
     /// Instant in time.
     Timestamp(OffsetDateTime),
-    /// Iceberg schema ID.
-    SchemaId(i32),
-    /// Iceberg field ID.
-    FieldId(i32),
     /// Numeric value.
     Number(i64),
     /// Non-negative count.
     Count(usize),
     /// Boolean value.
     Bool(bool),
-    /// Requiredness/nullability value.
-    Required(bool),
-    /// Ordered list of code-like values.
-    CodeList(Vec<String>),
-    /// Ordered list of identifiers.
-    IdentifierList(Vec<String>),
+    /// Emphasized inline values.
+    Emphasis(Vec<DocumentValue>),
+    /// Strongly emphasized inline values.
+    Strong(Vec<DocumentValue>),
+    /// Link with inline label and target URI.
+    Link {
+        /// Link label.
+        label: Vec<DocumentValue>,
+        /// Link target.
+        target: String,
+    },
+    /// Image with alt text and source URI.
+    Image {
+        /// Image alt text.
+        alt: String,
+        /// Image source.
+        source: String,
+    },
+    /// Hard line break.
+    LineBreak,
 }
 
-/// Report-friendly view of an Iceberg schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchemaReport {
-    /// Fully qualified table identifier displayed in the title.
-    pub table_ident: String,
-    /// REST endpoint used to fetch the table metadata.
-    pub source_endpoint: String,
-    /// Retrieval timestamp.
-    pub retrieved_at: OffsetDateTime,
-    /// Iceberg schema ID.
-    pub schema_id: i32,
-    /// Identifier field names in schema order.
-    pub identifier_fields: Vec<String>,
-    /// Number of top-level fields.
-    pub top_level_field_count: usize,
-    /// Number of flattened rows including nested struct/list-struct fields.
-    pub total_field_count: usize,
-    /// Flattened field rows.
-    pub fields: Vec<FieldRow>,
-}
-
-/// One flattened schema field row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FieldRow {
-    /// Dot-separated field path. List element structs use `[]`.
-    pub path: String,
-    /// Iceberg type rendered compactly for schema reports.
-    pub field_type: String,
-    /// Whether the field is required.
-    pub required: bool,
-    /// Iceberg field ID.
-    pub field_id: i32,
-}
-
-/// Build a schema report from an Iceberg schema.
+/// Build a semantic document view from an Iceberg schema.
 #[must_use]
-pub fn schema_report(
+pub fn schema_document(
     table_ident: impl Into<String>,
     source_endpoint: impl Into<String>,
     retrieved_at: OffsetDateTime,
-    schema: &SchemaRef,
-) -> SchemaReport {
-    schema_report_from_schema(table_ident, source_endpoint, retrieved_at, schema.as_ref())
-}
-
-/// Build a schema report from an Iceberg schema.
-#[must_use]
-pub fn schema_report_from_schema(
-    table_ident: impl Into<String>,
-    source_endpoint: impl Into<String>,
-    retrieved_at: OffsetDateTime,
-    schema: &Schema,
-) -> SchemaReport {
+    schema: impl Borrow<Schema>,
+) -> Document {
+    let schema = schema.borrow();
     let identifier_ids = schema.identifier_field_ids().collect::<HashSet<_>>();
-    let mut fields = Vec::new();
+    let mut identifier_fields = Vec::new();
+    let mut field_rows = Vec::new();
 
-    flatten_fields(schema.as_struct().fields(), None, &mut fields);
+    flatten_fields(
+        schema.as_struct().fields(),
+        None,
+        &identifier_ids,
+        &mut identifier_fields,
+        &mut field_rows,
+    );
 
-    let identifier_fields = fields
-        .iter()
-        .filter(|field| identifier_ids.contains(&field.field_id))
-        .map(|field| field.path.clone())
-        .collect::<Vec<_>>();
+    let table_ident = table_ident.into();
 
-    SchemaReport {
-        table_ident: table_ident.into(),
-        source_endpoint: source_endpoint.into(),
-        retrieved_at,
-        schema_id: schema.schema_id(),
-        identifier_fields,
-        top_level_field_count: schema.as_struct().fields().len(),
-        total_field_count: fields.len(),
-        fields,
-    }
-}
-
-/// Build a presentation-neutral report document for a schema report.
-#[must_use]
-pub fn current_schema_report_document(report: &SchemaReport) -> ReportDocument {
-    ReportDocument {
-        title: ReportTitle {
-            label: "Schema",
-            subject: ReportValue::Code(report.table_ident.clone()),
-        },
-        properties: vec![
-            ReportProperty {
-                label: "Source endpoint",
-                value: ReportValue::Uri(report.source_endpoint.clone()),
-            },
-            ReportProperty {
-                label: "Retrieved at",
-                value: ReportValue::Timestamp(report.retrieved_at),
-            },
-            ReportProperty {
-                label: "Schema ID",
-                value: ReportValue::SchemaId(report.schema_id),
-            },
-            ReportProperty {
-                label: "Identifier fields",
-                value: ReportValue::IdentifierList(report.identifier_fields.clone()),
-            },
-            ReportProperty {
-                label: "Top-level field count",
-                value: ReportValue::Count(report.top_level_field_count),
-            },
-            ReportProperty {
-                label: "Total field count including nested fields",
-                value: ReportValue::Count(report.total_field_count),
-            },
-        ],
-        tables: vec![ReportTable {
-            title: "Fields",
-            columns: vec!["Path", "Type", "Required", "Field ID"],
-            rows: report
-                .fields
-                .iter()
-                .map(|field| ReportRow {
-                    cells: vec![
-                        ReportValue::Code(field.path.clone()),
-                        ReportValue::Code(field.field_type.clone()),
-                        ReportValue::Required(field.required),
-                        ReportValue::FieldId(field.field_id),
+    Document {
+        title: Cell::new(vec![
+            DocumentValue::Text("Schema: ".to_string()),
+            DocumentValue::Code(table_ident),
+        ]),
+        blocks: vec![
+            Block::Properties(vec![
+                Property {
+                    label: "Source endpoint".to_string(),
+                    value: Cell::value(DocumentValue::Uri(source_endpoint.into())),
+                },
+                Property {
+                    label: "Retrieved at".to_string(),
+                    value: Cell::value(DocumentValue::Timestamp(retrieved_at)),
+                },
+                Property {
+                    label: "Schema ID".to_string(),
+                    value: Cell::value(DocumentValue::Number(i64::from(schema.schema_id()))),
+                },
+                Property {
+                    label: "Identifier fields".to_string(),
+                    value: separated_code_cell(identifier_fields),
+                },
+                Property {
+                    label: "Top-level field count".to_string(),
+                    value: Cell::value(DocumentValue::Count(schema.as_struct().fields().len())),
+                },
+                Property {
+                    label: "Total field count including nested fields".to_string(),
+                    value: Cell::value(DocumentValue::Count(field_rows.len())),
+                },
+            ]),
+            Block::Section(Section {
+                title: Cell::text("Fields"),
+                blocks: vec![Block::Table(Table {
+                    columns: vec![
+                        Cell::text("Path"),
+                        Cell::text("Type"),
+                        Cell::text("Required"),
+                        Cell::text("Field ID"),
                     ],
-                })
-                .collect(),
-        }],
+                    rows: field_rows,
+                })],
+            }),
+        ],
     }
 }
 
-fn flatten_fields(fields: &[NestedFieldRef], parent_path: Option<&str>, rows: &mut Vec<FieldRow>) {
+fn separated_code_cell(values: impl IntoIterator<Item = String>) -> Cell {
+    let mut values = values.into_iter();
+    let Some(first) = values.next() else {
+        return Cell::text("none");
+    };
+
+    let mut cell_values = vec![DocumentValue::Code(first)];
+    for value in values {
+        cell_values.push(DocumentValue::Text(", ".to_string()));
+        cell_values.push(DocumentValue::Code(value));
+    }
+
+    Cell::new(cell_values)
+}
+
+fn flatten_fields(
+    fields: &[NestedFieldRef],
+    parent_path: Option<&str>,
+    identifier_ids: &HashSet<i32>,
+    identifier_fields: &mut Vec<String>,
+    rows: &mut Vec<Row>,
+) {
     for field in fields {
         let path = match parent_path {
             Some(parent_path) => format!("{parent_path}.{}", field.name),
             None => field.name.clone(),
         };
 
-        rows.push(FieldRow {
-            path: path.clone(),
-            field_type: type_summary(&field.field_type),
-            required: field.required,
-            field_id: field.id,
+        if identifier_ids.contains(&field.id) {
+            identifier_fields.push(path.clone());
+        }
+
+        rows.push(Row {
+            cells: vec![
+                Cell::code(path.clone()),
+                Cell::code(type_summary(&field.field_type)),
+                Cell::value(DocumentValue::Bool(field.required)),
+                Cell::value(DocumentValue::Number(i64::from(field.id))),
+            ],
         });
 
         match field.field_type.as_ref() {
-            Type::Struct(struct_type) => flatten_fields(struct_type.fields(), Some(&path), rows),
+            Type::Struct(struct_type) => flatten_fields(
+                struct_type.fields(),
+                Some(&path),
+                identifier_ids,
+                identifier_fields,
+                rows,
+            ),
             Type::List(list_type) => {
                 if let Type::Struct(struct_type) = list_type.element_field.field_type.as_ref() {
-                    flatten_fields(struct_type.fields(), Some(&format!("{path}[]")), rows);
+                    flatten_fields(
+                        struct_type.fields(),
+                        Some(&format!("{path}[]")),
+                        identifier_ids,
+                        identifier_fields,
+                        rows,
+                    );
                 }
             }
             Type::Primitive(_) | Type::Map(_) => {}
@@ -285,11 +367,10 @@ mod tests {
     use crate::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
     use time::OffsetDateTime;
 
-    use super::{ReportValue, current_schema_report_document, schema_report_from_schema};
+    use super::{Block, Cell, DocumentValue, schema_document};
 
-    #[test]
-    fn builds_current_schema_report_document() {
-        let schema = Schema::builder()
+    fn nested_schema() -> Schema {
+        Schema::builder()
             .with_schema_id(3)
             .with_identifier_field_ids([1])
             .with_fields([
@@ -341,54 +422,81 @@ mod tests {
                 .into(),
             ])
             .build()
-            .expect("valid schema");
+            .expect("valid schema")
+    }
 
-        let report = schema_report_from_schema(
+    #[test]
+    fn builds_current_schema_document() {
+        let schema = nested_schema();
+
+        let document = schema_document(
             "lakehouse.redapl_v3.k8s_pod_blue",
             "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
-            &schema,
+            schema,
         );
 
-        assert_eq!(3, report.schema_id);
-        assert_eq!(vec!["org_id"], report.identifier_fields);
-        assert_eq!(3, report.top_level_field_count);
-        assert_eq!(5, report.total_field_count);
-
-        let document = current_schema_report_document(&report);
-
-        assert_eq!("Schema", document.title.label);
         assert_eq!(
-            ReportValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string()),
-            document.title.subject
+            Cell::new(vec![
+                DocumentValue::Text("Schema: ".to_string()),
+                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+            ]),
+            document.title
         );
-        assert_eq!("Identifier fields", document.properties[3].label);
+
+        let Block::Properties(properties) = &document.blocks[0] else {
+            panic!("first block should be properties");
+        };
+
+        assert_eq!("Identifier fields", properties[3].label);
         assert_eq!(
-            ReportValue::IdentifierList(vec!["org_id".to_string()]),
-            document.properties[3].value
+            Cell::new(vec![DocumentValue::Code("org_id".to_string())]),
+            properties[3].value
         );
-        assert_eq!("Fields", document.tables[0].title);
+        assert_eq!("Top-level field count", properties[4].label);
+        assert_eq!(Cell::value(DocumentValue::Count(3)), properties[4].value);
         assert_eq!(
-            vec!["Path", "Type", "Required", "Field ID"],
-            document.tables[0].columns
+            "Total field count including nested fields",
+            properties[5].label
+        );
+        assert_eq!(Cell::value(DocumentValue::Count(5)), properties[5].value);
+
+        let Block::Section(section) = &document.blocks[1] else {
+            panic!("second block should be a section");
+        };
+
+        assert_eq!(Cell::text("Fields"), section.title);
+
+        let Block::Table(table) = &section.blocks[0] else {
+            panic!("fields section should contain a table");
+        };
+
+        assert_eq!(
+            vec![
+                Cell::text("Path"),
+                Cell::text("Type"),
+                Cell::text("Required"),
+                Cell::text("Field ID")
+            ],
+            table.columns
         );
         assert_eq!(
             vec![
-                ReportValue::Code("metadata.labels".to_string()),
-                ReportValue::Code("map<string, string>".to_string()),
-                ReportValue::Required(false),
-                ReportValue::FieldId(3),
+                Cell::code("metadata.labels"),
+                Cell::code("map<string, string>"),
+                Cell::value(DocumentValue::Bool(false)),
+                Cell::value(DocumentValue::Number(3)),
             ],
-            document.tables[0].rows[2].cells
+            table.rows[2].cells
         );
         assert_eq!(
             vec![
-                ReportValue::Code("containers[].name".to_string()),
-                ReportValue::Code("string".to_string()),
-                ReportValue::Required(false),
-                ReportValue::FieldId(8),
+                Cell::code("containers[].name"),
+                Cell::code("string"),
+                Cell::value(DocumentValue::Bool(false)),
+                Cell::value(DocumentValue::Number(8)),
             ],
-            document.tables[0].rows[4].cells
+            table.rows[4].cells
         );
     }
 }

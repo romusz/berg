@@ -6,7 +6,7 @@ use anyhow::{Context, anyhow};
 use berg_core::engine::{
     QualifiedTableIdent, RestCatalogConfig, load_current_schema, parse_catalog_property,
 };
-use berg_core::view::{ReportDocument, ReportValue, current_schema_report_document, schema_report};
+use berg_core::view::{Block, Cell, Document, DocumentValue, List, ListKind, schema_document};
 use clap::{Args, Parser, Subcommand};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -127,17 +127,14 @@ async fn print_current_schema(
                 table.display_name()
             )
         })?;
-    let report = schema_report(
+    let document = schema_document(
         table.display_name(),
         config.table_endpoint(table.table()),
         OffsetDateTime::now_utc(),
-        &schema,
+        schema,
     );
 
-    print!(
-        "{}",
-        render_report_document_markdown(&current_schema_report_document(&report))
-    );
+    print!("{}", render_document_markdown(&document));
 
     Ok(())
 }
@@ -211,81 +208,180 @@ fn parse_header_property(value: &str) -> anyhow::Result<(String, String)> {
     Ok((format!("header.{key}"), value))
 }
 
-fn render_report_document_markdown(document: &ReportDocument) -> String {
+fn render_document_markdown(document: &Document) -> String {
     let mut markdown = String::new();
 
-    writeln!(
-        markdown,
-        "# {}: {}",
-        document.title.label,
-        render_report_value_markdown(&document.title.subject)
-    )
-    .expect("write to string");
+    writeln!(markdown, "# {}", render_cell_markdown(&document.title)).expect("write to string");
     writeln!(markdown).expect("write to string");
 
-    for property in &document.properties {
-        writeln!(
-            markdown,
-            "- {}: {}",
-            property.label,
-            render_report_value_markdown(&property.value)
-        )
-        .expect("write to string");
-    }
-
-    for table in &document.tables {
-        writeln!(markdown).expect("write to string");
-        writeln!(markdown, "## {}", table.title).expect("write to string");
-        writeln!(markdown).expect("write to string");
-        writeln!(markdown, "| {} |", table.columns.join(" | ")).expect("write to string");
-        writeln!(
-            markdown,
-            "| {} |",
-            vec!["---"; table.columns.len()].join(" | ")
-        )
-        .expect("write to string");
-
-        for row in &table.rows {
-            let cells = row
-                .cells
-                .iter()
-                .map(|cell| escape_markdown_table_cell(&render_report_value_markdown(cell)))
-                .collect::<Vec<_>>();
-            writeln!(markdown, "| {} |", cells.join(" | ")).expect("write to string");
-        }
-    }
+    render_blocks_markdown(&document.blocks, 2, &mut markdown);
 
     markdown
 }
 
-fn render_report_value_markdown(value: &ReportValue) -> String {
+fn render_blocks_markdown(blocks: &[Block], heading_level: usize, markdown: &mut String) {
+    for block in blocks {
+        match block {
+            Block::Paragraph(cell) => {
+                writeln!(markdown, "{}", render_cell_markdown(cell)).expect("write to string");
+            }
+            Block::Properties(properties) => {
+                for property in properties {
+                    writeln!(
+                        markdown,
+                        "- {}: {}",
+                        property.label,
+                        render_cell_markdown(&property.value)
+                    )
+                    .expect("write to string");
+                }
+            }
+            Block::Table(table) => {
+                let columns = table
+                    .columns
+                    .iter()
+                    .map(|cell| escape_markdown_table_cell(&render_cell_markdown(cell)))
+                    .collect::<Vec<_>>();
+                writeln!(markdown, "| {} |", columns.join(" | ")).expect("write to string");
+                writeln!(
+                    markdown,
+                    "| {} |",
+                    vec!["---"; table.columns.len()].join(" | ")
+                )
+                .expect("write to string");
+
+                for row in &table.rows {
+                    let cells = row
+                        .cells
+                        .iter()
+                        .map(|cell| escape_markdown_table_cell(&render_cell_markdown(cell)))
+                        .collect::<Vec<_>>();
+                    writeln!(markdown, "| {} |", cells.join(" | ")).expect("write to string");
+                }
+            }
+            Block::Section(section) => {
+                writeln!(markdown).expect("write to string");
+                writeln!(
+                    markdown,
+                    "{} {}",
+                    "#".repeat(heading_level.min(6)),
+                    render_cell_markdown(&section.title)
+                )
+                .expect("write to string");
+                writeln!(markdown).expect("write to string");
+                render_blocks_markdown(&section.blocks, heading_level + 1, markdown);
+            }
+            Block::List(list) => render_list_markdown(list, heading_level, markdown),
+            Block::FencedCode(code) => {
+                writeln!(
+                    markdown,
+                    "```{}",
+                    code.language.as_deref().unwrap_or_default()
+                )
+                .expect("write to string");
+                writeln!(markdown, "{}", code.code).expect("write to string");
+                writeln!(markdown, "```").expect("write to string");
+            }
+            Block::ThematicBreak => {
+                writeln!(markdown, "---").expect("write to string");
+            }
+        }
+
+        writeln!(markdown).expect("write to string");
+    }
+}
+
+fn render_list_markdown(list: &List, heading_level: usize, markdown: &mut String) {
+    for (index, item) in list.items.iter().enumerate() {
+        let marker = match list.kind {
+            ListKind::Unordered => "- ".to_string(),
+            ListKind::Ordered { start } => format!("{}. ", start + index),
+        };
+
+        let Some((first_block, remaining_blocks)) = item.blocks.split_first() else {
+            writeln!(markdown, "{}", marker.trim_end()).expect("write to string");
+            continue;
+        };
+
+        if let Block::Paragraph(cell) = first_block {
+            writeln!(markdown, "{marker}{}", render_cell_markdown(cell)).expect("write to string");
+            render_indented_blocks_markdown(
+                remaining_blocks,
+                heading_level,
+                marker.len(),
+                markdown,
+            );
+        } else {
+            writeln!(markdown, "{}", marker.trim_end()).expect("write to string");
+            render_indented_blocks_markdown(&item.blocks, heading_level, marker.len(), markdown);
+        }
+    }
+}
+
+fn render_indented_blocks_markdown(
+    blocks: &[Block],
+    heading_level: usize,
+    spaces: usize,
+    markdown: &mut String,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+
+    let mut nested_markdown = String::new();
+    render_blocks_markdown(blocks, heading_level, &mut nested_markdown);
+    let indentation = " ".repeat(spaces);
+
+    for line in nested_markdown.lines() {
+        if line.is_empty() {
+            writeln!(markdown).expect("write to string");
+        } else {
+            writeln!(markdown, "{indentation}{line}").expect("write to string");
+        }
+    }
+}
+
+fn render_cell_markdown(cell: &Cell) -> String {
+    cell.values
+        .iter()
+        .map(render_document_value_markdown)
+        .collect::<String>()
+}
+
+fn render_document_value_markdown(value: &DocumentValue) -> String {
     match value {
-        ReportValue::Text(value) => value.clone(),
-        ReportValue::Code(value) => format!("`{value}`"),
-        ReportValue::Uri(value) => render_uri_markdown(value),
-        ReportValue::Timestamp(value) => format!("`{}`", render_timestamp_utc(*value)),
-        ReportValue::SchemaId(value) | ReportValue::FieldId(value) => format!("`{value}`"),
-        ReportValue::Number(value) => format!("`{value}`"),
-        ReportValue::Count(value) => format!("`{value}`"),
-        ReportValue::Bool(value) | ReportValue::Required(value) => {
+        DocumentValue::Text(value) => value.clone(),
+        DocumentValue::Code(value) => format!("`{value}`"),
+        DocumentValue::Uri(value) => render_uri_markdown(value),
+        DocumentValue::Timestamp(value) => format!("`{}`", render_timestamp_utc(*value)),
+        DocumentValue::Number(value) => format!("`{value}`"),
+        DocumentValue::Count(value) => format!("`{value}`"),
+        DocumentValue::Bool(value) => {
             if *value {
                 "yes".to_string()
             } else {
                 "no".to_string()
             }
         }
-        ReportValue::CodeList(values) | ReportValue::IdentifierList(values) => {
-            if values.is_empty() {
-                "none".to_string()
-            } else {
-                values
-                    .iter()
-                    .map(|value| format!("`{value}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }
+        DocumentValue::Emphasis(values) => {
+            format!("*{}*", render_document_values_markdown(values))
         }
+        DocumentValue::Strong(values) => {
+            format!("**{}**", render_document_values_markdown(values))
+        }
+        DocumentValue::Link { label, target } => {
+            format!("[{}]({target})", render_document_values_markdown(label))
+        }
+        DocumentValue::Image { alt, source } => format!("![{alt}]({source})"),
+        DocumentValue::LineBreak => "  \n".to_string(),
     }
+}
+
+fn render_document_values_markdown(values: &[DocumentValue]) -> String {
+    values
+        .iter()
+        .map(render_document_value_markdown)
+        .collect::<String>()
 }
 
 fn render_uri_markdown(value: &str) -> String {
@@ -310,54 +406,100 @@ fn render_timestamp_utc(timestamp: OffsetDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use berg_core::view::{ReportDocument, ReportProperty, ReportRow, ReportTable, ReportTitle};
+    use berg_core::view::{
+        Block, Document, List, ListItem, ListKind, Property, Row, Section, Table,
+    };
 
-    use super::{ReportValue, render_report_document_markdown};
+    use super::{Cell, DocumentValue, render_document_markdown};
 
     #[test]
-    fn renders_report_document_as_markdown() {
-        let document = ReportDocument {
-            title: ReportTitle {
-                label: "Schema",
-                subject: ReportValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string()),
-            },
-            properties: vec![
-                ReportProperty {
-                    label: "Source endpoint",
-                    value: ReportValue::Uri("https://example.test/catalog".to_string()),
-                },
-                ReportProperty {
-                    label: "Schema ID",
-                    value: ReportValue::SchemaId(3),
-                },
-                ReportProperty {
-                    label: "Identifier fields",
-                    value: ReportValue::IdentifierList(vec![
-                        "org_id".to_string(),
-                        "_key".to_string(),
-                    ]),
-                },
-            ],
-            tables: vec![ReportTable {
-                title: "Fields",
-                columns: vec!["Path", "Type", "Required", "Field ID"],
-                rows: vec![ReportRow {
-                    cells: vec![
-                        ReportValue::Code("metadata.labels".to_string()),
-                        ReportValue::Code("map<string, string>".to_string()),
-                        ReportValue::Required(false),
-                        ReportValue::FieldId(36),
+    fn renders_document_as_markdown() {
+        let document = Document {
+            title: Cell::new(vec![
+                DocumentValue::Text("Schema: ".to_string()),
+                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string()),
+            ]),
+            blocks: vec![
+                Block::Properties(vec![
+                    Property {
+                        label: "Source endpoint".to_string(),
+                        value: Cell::value(DocumentValue::Uri(
+                            "https://example.test/catalog".to_string(),
+                        )),
+                    },
+                    Property {
+                        label: "Schema ID".to_string(),
+                        value: Cell::value(DocumentValue::Number(3)),
+                    },
+                    Property {
+                        label: "Identifier fields".to_string(),
+                        value: Cell::new(vec![
+                            DocumentValue::Code("org_id".to_string()),
+                            DocumentValue::Text(", ".to_string()),
+                            DocumentValue::Code("_key".to_string()),
+                        ]),
+                    },
+                ]),
+                Block::Section(Section {
+                    title: Cell::text("Fields"),
+                    blocks: vec![
+                        Block::Table(Table {
+                            columns: vec![
+                                Cell::text("Path"),
+                                Cell::text("Type"),
+                                Cell::text("Required"),
+                                Cell::text("Field ID"),
+                            ],
+                            rows: vec![Row {
+                                cells: vec![
+                                    Cell::code("metadata.labels"),
+                                    Cell::code("map<string, string>"),
+                                    Cell::value(DocumentValue::Bool(false)),
+                                    Cell::value(DocumentValue::Number(36)),
+                                ],
+                            }],
+                        }),
+                        Block::Section(Section {
+                            title: Cell::text("Nested"),
+                            blocks: vec![Block::Paragraph(Cell::text("details"))],
+                        }),
                     ],
-                }],
-            }],
+                }),
+                Block::List(List {
+                    kind: ListKind::Ordered { start: 1 },
+                    items: vec![
+                        ListItem {
+                            blocks: vec![Block::Paragraph(Cell::text("Load table metadata"))],
+                        },
+                        ListItem {
+                            blocks: vec![
+                                Block::Paragraph(Cell::text("Derive schema view")),
+                                Block::List(List {
+                                    kind: ListKind::Unordered,
+                                    items: vec![ListItem {
+                                        blocks: vec![Block::Paragraph(Cell::text(
+                                            "Flatten nested fields",
+                                        ))],
+                                    }],
+                                }),
+                            ],
+                        },
+                    ],
+                }),
+            ],
         };
 
-        let markdown = render_report_document_markdown(&document);
+        let markdown = render_document_markdown(&document);
 
         assert!(markdown.contains("# Schema: `lakehouse.redapl_v3.k8s_pod_blue`"));
         assert!(markdown.contains("- Source endpoint: `https://example.test/catalog`"));
         assert!(markdown.contains("- Schema ID: `3`"));
         assert!(markdown.contains("- Identifier fields: `org_id`, `_key`"));
+        assert!(markdown.contains("## Fields"));
+        assert!(markdown.contains("### Nested"));
         assert!(markdown.contains("| `metadata.labels` | `map<string, string>` | no | `36` |"));
+        assert!(markdown.contains("1. Load table metadata"));
+        assert!(markdown.contains("2. Derive schema view"));
+        assert!(markdown.contains("   - Flatten nested fields"));
     }
 }

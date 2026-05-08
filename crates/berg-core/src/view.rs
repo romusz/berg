@@ -34,7 +34,9 @@
 use std::borrow::Borrow;
 use std::collections::HashSet;
 
-use crate::engine::{CurrentDataFileSizeStats, CurrentTableStats, DataFileSizeDistribution};
+use crate::engine::{
+    CurrentDataFileSizeStats, CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
+};
 use crate::spec::{NestedFieldRef, Schema, Type};
 use time::OffsetDateTime;
 
@@ -357,9 +359,16 @@ pub fn data_file_size_stats_document(
                 title: Cell::text("Data File Sizes"),
                 blocks: vec![
                     Block::Properties(data_file_size_properties(stats)),
-                    Block::Table(data_file_size_distribution_table(
-                        stats.distribution.as_ref(),
-                    )),
+                    Block::Section(Section {
+                        title: Cell::text("Distribution"),
+                        blocks: vec![Block::Table(data_file_size_distribution_table(
+                            stats.distribution.as_ref(),
+                        ))],
+                    }),
+                    Block::Section(Section {
+                        title: Cell::text("Buckets"),
+                        blocks: vec![Block::Table(data_file_size_bucket_table(&stats.buckets))],
+                    }),
                 ],
             }),
         ],
@@ -400,6 +409,10 @@ fn data_file_size_properties(stats: &CurrentDataFileSizeStats) -> Vec<Property> 
         Property {
             label: "Data files".to_string(),
             value: Cell::value(DocumentValue::Unsigned(stats.data_file_count)),
+        },
+        Property {
+            label: "Target file size".to_string(),
+            value: Cell::value(DocumentValue::Bytes(stats.target_file_size_bytes)),
         },
         Property {
             label: "Average data file size".to_string(),
@@ -443,6 +456,35 @@ fn data_file_size_distribution_table(distribution: Option<&DataFileSizeDistribut
 fn data_file_size_distribution_row(label: &str, size_bytes: Option<u64>) -> Row {
     Row {
         cells: vec![Cell::text(label), optional_bytes_cell(size_bytes)],
+    }
+}
+
+fn data_file_size_bucket_table(buckets: &[DataFileSizeBucketStats]) -> Table {
+    Table {
+        columns: vec![
+            Cell::text("Bucket"),
+            Cell::text("Files"),
+            Cell::text("Size"),
+            Cell::text("Files %"),
+            Cell::text("Size %"),
+        ],
+        rows: buckets.iter().map(data_file_size_bucket_row).collect(),
+    }
+}
+
+fn data_file_size_bucket_row(bucket: &DataFileSizeBucketStats) -> Row {
+    Row {
+        cells: vec![
+            Cell::text(bucket.label.clone()),
+            Cell::value(DocumentValue::Unsigned(bucket.file_count)),
+            Cell::value(DocumentValue::Bytes(bucket.total_size_bytes)),
+            Cell::value(DocumentValue::PercentageMillis(
+                bucket.file_percentage_millis,
+            )),
+            Cell::value(DocumentValue::PercentageMillis(
+                bucket.size_percentage_millis,
+            )),
+        ],
     }
 }
 
@@ -693,7 +735,10 @@ fn type_summary(field_type: &Type) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::{CurrentDataFileSizeStats, CurrentTableStats, DataFileSizeDistribution};
+    use crate::engine::{
+        CurrentDataFileSizeStats, CurrentTableStats, DataFileSizeBucketStats,
+        DataFileSizeDistribution,
+    };
     use crate::spec::{
         ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type,
     };
@@ -996,6 +1041,7 @@ mod tests {
             snapshot_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
                 .expect("valid timestamp"),
             manifest_list_path: "s3://warehouse/table/metadata/snap-42.avro".to_string(),
+            target_file_size_bytes: 512,
             data_file_count: 5,
             avg_data_file_size_bytes: Some(300),
             distribution: Some(DataFileSizeDistribution {
@@ -1006,6 +1052,13 @@ mod tests {
                 p95: 480,
                 max: 500,
             }),
+            buckets: vec![DataFileSizeBucketStats {
+                label: "75-125% target".to_string(),
+                file_count: 2,
+                total_size_bytes: 600,
+                file_percentage_millis: 40_000,
+                size_percentage_millis: 50_000,
+            }],
         };
 
         let document = data_file_size_stats_document(
@@ -1040,14 +1093,22 @@ mod tests {
             Cell::value(DocumentValue::Unsigned(5)),
             size_properties[0].value
         );
-        assert_eq!("Average data file size", size_properties[1].label);
+        assert_eq!("Target file size", size_properties[1].label);
         assert_eq!(
-            Cell::value(DocumentValue::Bytes(300)),
+            Cell::value(DocumentValue::Bytes(512)),
             size_properties[1].value
         );
+        assert_eq!("Average data file size", size_properties[2].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Bytes(300)),
+            size_properties[2].value
+        );
 
-        let Block::Table(distribution_table) = &data_file_sizes.blocks[1] else {
-            panic!("data file sizes section should contain a table");
+        let Block::Section(distribution) = &data_file_sizes.blocks[1] else {
+            panic!("data file sizes section should contain distribution section");
+        };
+        let Block::Table(distribution_table) = &distribution.blocks[0] else {
+            panic!("distribution section should contain a table");
         };
         assert_eq!(
             vec![Cell::text("Statistic"), Cell::text("Size")],
@@ -1056,6 +1117,34 @@ mod tests {
         assert_eq!(
             vec![Cell::text("p50"), Cell::value(DocumentValue::Bytes(300))],
             distribution_table.rows[2].cells
+        );
+
+        let Block::Section(buckets) = &data_file_sizes.blocks[2] else {
+            panic!("data file sizes section should contain buckets section");
+        };
+        let Block::Table(bucket_table) = &buckets.blocks[0] else {
+            panic!("buckets section should contain a table");
+        };
+        assert_eq!(Cell::text("Buckets"), buckets.title);
+        assert_eq!(
+            vec![
+                Cell::text("Bucket"),
+                Cell::text("Files"),
+                Cell::text("Size"),
+                Cell::text("Files %"),
+                Cell::text("Size %")
+            ],
+            bucket_table.columns
+        );
+        assert_eq!(
+            vec![
+                Cell::text("75-125% target"),
+                Cell::value(DocumentValue::Unsigned(2)),
+                Cell::value(DocumentValue::Bytes(600)),
+                Cell::value(DocumentValue::PercentageMillis(40_000)),
+                Cell::value(DocumentValue::PercentageMillis(50_000)),
+            ],
+            bucket_table.rows[0].cells
         );
     }
 }

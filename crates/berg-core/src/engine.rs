@@ -162,12 +162,31 @@ pub struct CurrentDataFileSizeStats {
     pub snapshot_updated_at: OffsetDateTime,
     /// Current snapshot manifest list location.
     pub manifest_list_path: String,
+    /// Target data file size from table properties, or Iceberg's default.
+    pub target_file_size_bytes: u64,
     /// Number of live data files.
     pub data_file_count: u64,
     /// Average live data file size, rounded to the nearest byte.
     pub avg_data_file_size_bytes: Option<u64>,
     /// Distribution of live data file sizes.
     pub distribution: Option<DataFileSizeDistribution>,
+    /// Data file size bucket summaries.
+    pub buckets: Vec<DataFileSizeBucketStats>,
+}
+
+/// Data file size bucket summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataFileSizeBucketStats {
+    /// Human-readable bucket range label.
+    pub label: String,
+    /// Number of live data files in this bucket.
+    pub file_count: u64,
+    /// Total bytes across live data files in this bucket.
+    pub total_size_bytes: u64,
+    /// File-count share stored as thousandths of one percent.
+    pub file_percentage_millis: u64,
+    /// Byte-size share stored as thousandths of one percent.
+    pub size_percentage_millis: u64,
 }
 
 /// Percentile distribution for a set of data file sizes.
@@ -398,6 +417,7 @@ pub async fn load_current_data_file_size_stats(
         .load_manifest_list(table.file_io(), &table.metadata_ref())
         .await?;
     let snapshot_updated_at = snapshot_updated_at(snapshot.snapshot_id(), snapshot.timestamp_ms())?;
+    let target_file_size_bytes = target_file_size_bytes(metadata.properties());
     let mut data_file_sizes = Vec::new();
 
     for manifest_file in manifest_list.entries() {
@@ -423,15 +443,26 @@ pub async fn load_current_data_file_size_stats(
     let data_file_count = data_file_sizes.len() as u64;
     let avg_data_file_size_bytes = rounded_average(&data_file_sizes);
     let distribution = data_file_size_distribution(&data_file_sizes);
+    let buckets = data_file_size_buckets(&data_file_sizes, target_file_size_bytes);
 
     Ok(CurrentDataFileSizeStats {
         snapshot_id: snapshot.snapshot_id(),
         snapshot_updated_at,
         manifest_list_path,
+        target_file_size_bytes,
         data_file_count,
         avg_data_file_size_bytes,
         distribution,
+        buckets,
     })
+}
+
+fn target_file_size_bytes(properties: &HashMap<String, String>) -> u64 {
+    properties
+        .get(spec::TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(spec::TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT as u64)
 }
 
 fn snapshot_updated_at(snapshot_id: i64, timestamp_ms: i64) -> Result<OffsetDateTime> {
@@ -466,6 +497,109 @@ fn data_file_size_distribution(sorted_values: &[u64]) -> Option<DataFileSizeDist
         p95: percentile(sorted_values, 95, 100),
         max: *sorted_values.last()?,
     })
+}
+
+fn data_file_size_buckets(
+    sorted_values: &[u64],
+    target_file_size_bytes: u64,
+) -> Vec<DataFileSizeBucketStats> {
+    let total_file_count = sorted_values.len() as u64;
+    let total_size_bytes = sorted_values
+        .iter()
+        .fold(0_u64, |total, size| total.saturating_add(*size));
+    let bucket_specs = data_file_size_bucket_specs(target_file_size_bytes);
+    let mut buckets = bucket_specs
+        .iter()
+        .map(|spec| DataFileSizeBucketStats {
+            label: spec.label.clone(),
+            file_count: 0,
+            total_size_bytes: 0,
+            file_percentage_millis: 0,
+            size_percentage_millis: 0,
+        })
+        .collect::<Vec<_>>();
+
+    for size_bytes in sorted_values {
+        let bucket_index = bucket_specs
+            .iter()
+            .position(|bucket| bucket.contains(*size_bytes))
+            .unwrap_or(bucket_specs.len() - 1);
+        buckets[bucket_index].file_count += 1;
+        buckets[bucket_index].total_size_bytes = buckets[bucket_index]
+            .total_size_bytes
+            .saturating_add(*size_bytes);
+    }
+
+    for bucket in &mut buckets {
+        bucket.file_percentage_millis =
+            ratio_percentage_millis(bucket.file_count, total_file_count);
+        bucket.size_percentage_millis =
+            ratio_percentage_millis(bucket.total_size_bytes, total_size_bytes);
+    }
+
+    buckets
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DataFileSizeBucketSpec {
+    label: String,
+    lower_bound_inclusive: u64,
+    upper_bound_exclusive: Option<u64>,
+}
+
+impl DataFileSizeBucketSpec {
+    fn contains(&self, size_bytes: u64) -> bool {
+        size_bytes >= self.lower_bound_inclusive
+            && self
+                .upper_bound_exclusive
+                .is_none_or(|upper_bound| size_bytes < upper_bound)
+    }
+}
+
+fn data_file_size_bucket_specs(target_file_size_bytes: u64) -> Vec<DataFileSizeBucketSpec> {
+    const MIB: u64 = 1024 * 1024;
+
+    let target_25 = target_file_size_bytes / 4;
+    let target_75 = target_file_size_bytes.saturating_mul(3) / 4;
+    let target_125 = target_file_size_bytes.saturating_mul(5) / 4;
+    let target_200 = target_file_size_bytes.saturating_mul(2);
+    let candidates = [
+        ("< 16 MiB".to_string(), 0, Some(16 * MIB)),
+        ("16-64 MiB".to_string(), 16 * MIB, Some(64 * MIB)),
+        ("64 MiB-25% target".to_string(), 64 * MIB, Some(target_25)),
+        ("25-75% target".to_string(), target_25, Some(target_75)),
+        ("75-125% target".to_string(), target_75, Some(target_125)),
+        ("125-200% target".to_string(), target_125, Some(target_200)),
+        ("> 200% target".to_string(), target_200, None),
+    ];
+
+    candidates
+        .into_iter()
+        .filter_map(|(label, lower_bound_inclusive, upper_bound_exclusive)| {
+            if upper_bound_exclusive.is_some_and(|upper_bound| upper_bound <= lower_bound_inclusive)
+            {
+                return None;
+            }
+
+            Some(DataFileSizeBucketSpec {
+                label,
+                lower_bound_inclusive,
+                upper_bound_exclusive,
+            })
+        })
+        .collect()
+}
+
+fn ratio_percentage_millis(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+
+    let numerator = u128::from(numerator);
+    let denominator = u128::from(denominator);
+    let rounded = (numerator * 100_000 + denominator / 2) / denominator;
+
+    rounded.min(u128::from(u64::MAX)) as u64
 }
 
 fn percentile(sorted_values: &[u64], numerator: usize, denominator: usize) -> u64 {
@@ -644,8 +778,8 @@ mod tests {
 
     use super::{
         DataFileSizeDistribution, QualifiedTableIdent, RestCatalogConfig,
-        credential_from_env_output, data_file_size_distribution, parse_catalog_property,
-        rounded_average,
+        credential_from_env_output, data_file_size_buckets, data_file_size_distribution,
+        parse_catalog_property, rounded_average,
     };
 
     #[test]
@@ -739,5 +873,35 @@ AWS_SESSION_TOKEN='token'
     fn computes_rounded_data_file_size_average() {
         assert_eq!(Some(151), rounded_average(&[100, 201]));
         assert_eq!(None, rounded_average(&[]));
+    }
+
+    #[test]
+    fn computes_data_file_size_buckets() {
+        let mib = 1024 * 1024;
+        let sizes = [
+            8 * mib,
+            32 * mib,
+            80 * mib,
+            400 * mib,
+            700 * mib,
+            1100 * mib,
+        ];
+
+        let buckets = data_file_size_buckets(&sizes, 512 * mib);
+
+        assert_eq!("< 16 MiB", buckets[0].label);
+        assert_eq!(1, buckets[0].file_count);
+        assert_eq!(8 * mib, buckets[0].total_size_bytes);
+        assert_eq!(16_667, buckets[0].file_percentage_millis);
+        assert_eq!(345, buckets[0].size_percentage_millis);
+        assert_eq!("75-125% target", buckets[4].label);
+        assert_eq!(1, buckets[4].file_count);
+        assert_eq!(400 * mib, buckets[4].total_size_bytes);
+        assert_eq!("125-200% target", buckets[5].label);
+        assert_eq!(1, buckets[5].file_count);
+        assert_eq!(700 * mib, buckets[5].total_size_bytes);
+        assert_eq!("> 200% target", buckets[6].label);
+        assert_eq!(1, buckets[6].file_count);
+        assert_eq!(1100 * mib, buckets[6].total_size_bytes);
     }
 }

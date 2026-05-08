@@ -181,6 +181,8 @@ pub struct DataFileSizeDistribution {
     pub p50: u64,
     /// 75th percentile data file size.
     pub p75: u64,
+    /// 95th percentile data file size.
+    pub p95: u64,
     /// Largest data file size.
     pub max: u64,
 }
@@ -461,6 +463,7 @@ fn data_file_size_distribution(sorted_values: &[u64]) -> Option<DataFileSizeDist
         p25: percentile(sorted_values, 1, 4),
         p50: percentile(sorted_values, 1, 2),
         p75: percentile(sorted_values, 3, 4),
+        p95: percentile(sorted_values, 95, 100),
         max: *sorted_values.last()?,
     })
 }
@@ -725,6 +728,7 @@ AWS_SESSION_TOKEN='token'
                 p25: 200,
                 p50: 300,
                 p75: 400,
+                p95: 480,
                 max: 500,
             },
             distribution

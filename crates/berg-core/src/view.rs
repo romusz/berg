@@ -429,6 +429,10 @@ fn data_file_size_distribution_table(distribution: Option<&DataFileSizeDistribut
                 distribution.map(|distribution| distribution.p75),
             ),
             data_file_size_distribution_row(
+                "p95",
+                distribution.map(|distribution| distribution.p95),
+            ),
+            data_file_size_distribution_row(
                 "max",
                 distribution.map(|distribution| distribution.max),
             ),
@@ -999,6 +1003,7 @@ mod tests {
                 p25: 200,
                 p50: 300,
                 p75: 400,
+                p95: 480,
                 max: 500,
             }),
         };

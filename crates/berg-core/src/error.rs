@@ -28,6 +28,18 @@ pub enum BergError {
     #[error("invalid catalog property `{value}`: expected key=value")]
     InvalidCatalogProperty { value: String },
 
+    /// The requested table does not have a current snapshot.
+    #[error("table `{table}` does not have a current snapshot")]
+    NoCurrentSnapshot { table: String },
+
+    /// A manifest list entry reported an invalid manifest file length.
+    #[error("manifest `{path}` has invalid length `{length}`")]
+    InvalidManifestLength { path: String, length: i64 },
+
+    /// A snapshot timestamp could not be represented.
+    #[error("snapshot `{snapshot_id}` has invalid timestamp `{timestamp_ms}`")]
+    InvalidSnapshotTimestamp { snapshot_id: i64, timestamp_ms: i64 },
+
     /// An error originating from `iceberg-rust`.
     #[error(transparent)]
     Iceberg(#[from] iceberg::Error),

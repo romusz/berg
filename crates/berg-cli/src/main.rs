@@ -4,11 +4,12 @@ use std::fmt::Write;
 
 use anyhow::{Context, anyhow};
 use berg_core::engine::{
-    QualifiedTableIdent, RestCatalogConfig, load_current_schema, load_current_table_stats,
-    parse_catalog_property,
+    QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats, load_current_schema,
+    load_current_table_stats, parse_catalog_property,
 };
 use berg_core::view::{
-    Block, Cell, Document, DocumentValue, List, ListKind, schema_document, table_stats_document,
+    Block, Cell, Document, DocumentValue, List, ListKind, data_file_size_stats_document,
+    schema_document, table_stats_document,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use time::format_description::well_known::Rfc3339;
@@ -146,8 +147,34 @@ struct TableArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableCommands {
+    /// Inspect Iceberg table files.
+    Files(TableFilesArgs),
     /// Inspect Iceberg table statistics.
     Stats(TableStatsArgs),
+}
+
+#[derive(Debug, Args)]
+struct TableFilesArgs {
+    #[command(subcommand)]
+    command: TableFilesCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum TableFilesCommands {
+    /// Inspect Iceberg data files.
+    Data(TableFilesDataArgs),
+}
+
+#[derive(Debug, Args)]
+struct TableFilesDataArgs {
+    #[command(subcommand)]
+    command: TableFilesDataCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum TableFilesDataCommands {
+    /// Show data file size statistics for the current snapshot of a fully-qualified table ID.
+    Stats(DataFileSizeStatsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -164,6 +191,15 @@ enum TableStatsCommands {
 
 #[derive(Debug, Args)]
 struct CurrentTableStatsArgs {
+    /// Fully-qualified table ID: catalog.namespace.table.
+    table: String,
+
+    #[command(flatten)]
+    output: DocumentOutputArgs,
+}
+
+#[derive(Debug, Args)]
+struct DataFileSizeStatsArgs {
     /// Fully-qualified table ID: catalog.namespace.table.
     table: String,
 
@@ -203,6 +239,13 @@ async fn main() -> anyhow::Result<()> {
             SchemaCommands::Current(args) => print_current_schema(args, catalog_args).await?,
         },
         Some(Commands::Table(table_args)) => match table_args.command {
+            TableCommands::Files(files_args) => match files_args.command {
+                TableFilesCommands::Data(data_args) => match data_args.command {
+                    TableFilesDataCommands::Stats(args) => {
+                        print_data_file_size_stats(args, catalog_args).await?;
+                    }
+                },
+            },
             TableCommands::Stats(stats_args) => match stats_args.command {
                 TableStatsCommands::Current(args) => {
                     print_current_table_stats(args, catalog_args).await?;
@@ -258,6 +301,33 @@ async fn print_current_table_stats(
             )
         })?;
     let document = table_stats_document(
+        table.display_name(),
+        config.table_endpoint(table.table()),
+        OffsetDateTime::now_utc(),
+        &stats,
+    );
+
+    print!("{}", render_document(&document, args.output.format)?);
+
+    Ok(())
+}
+
+async fn print_data_file_size_stats(
+    args: DataFileSizeStatsArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<()> {
+    let table = QualifiedTableIdent::parse(&args.table)?;
+    let config = rest_catalog_config(catalog_args, &table)?;
+
+    let stats = load_current_data_file_size_stats(&config, table.table())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load current data file size statistics for `{}`",
+                table.display_name()
+            )
+        })?;
+    let document = data_file_size_stats_document(
         table.display_name(),
         config.table_endpoint(table.table()),
         OffsetDateTime::now_utc(),
@@ -409,29 +479,7 @@ fn render_blocks_markdown(blocks: &[Block], heading_level: usize, markdown: &mut
                     .expect("write to string");
                 }
             }
-            Block::Table(table) => {
-                let columns = table
-                    .columns
-                    .iter()
-                    .map(|cell| escape_markdown_table_cell(&render_cell_markdown(cell)))
-                    .collect::<Vec<_>>();
-                writeln!(markdown, "| {} |", columns.join(" | ")).expect("write to string");
-                writeln!(
-                    markdown,
-                    "| {} |",
-                    vec!["---"; table.columns.len()].join(" | ")
-                )
-                .expect("write to string");
-
-                for row in &table.rows {
-                    let cells = row
-                        .cells
-                        .iter()
-                        .map(|cell| escape_markdown_table_cell(&render_cell_markdown(cell)))
-                        .collect::<Vec<_>>();
-                    writeln!(markdown, "| {} |", cells.join(" | ")).expect("write to string");
-                }
-            }
+            Block::Table(table) => render_table_markdown(table, markdown),
             Block::Section(section) => {
                 writeln!(markdown).expect("write to string");
                 writeln!(
@@ -461,6 +509,186 @@ fn render_blocks_markdown(blocks: &[Block], heading_level: usize, markdown: &mut
         }
 
         writeln!(markdown).expect("write to string");
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MarkdownTableColumn {
+    Source(usize),
+    Bytes(usize),
+    BinarySize(usize),
+}
+
+fn render_table_markdown(table: &berg_core::view::Table, markdown: &mut String) {
+    let columns = markdown_table_columns(table);
+    let headers = columns
+        .iter()
+        .map(|column| escape_markdown_table_cell(&render_table_header_markdown(table, *column)))
+        .collect::<Vec<_>>();
+    writeln!(markdown, "| {} |", headers.join(" | ")).expect("write to string");
+
+    let separators = columns
+        .iter()
+        .map(|column| {
+            if is_right_aligned_markdown_table_column(table, *column) {
+                "---:"
+            } else {
+                "---"
+            }
+        })
+        .collect::<Vec<_>>();
+    writeln!(markdown, "| {} |", separators.join(" | ")).expect("write to string");
+
+    for row in &table.rows {
+        let cells = columns
+            .iter()
+            .map(|column| escape_markdown_table_cell(&render_table_cell_markdown(row, *column)))
+            .collect::<Vec<_>>();
+        writeln!(markdown, "| {} |", cells.join(" | ")).expect("write to string");
+    }
+}
+
+fn markdown_table_columns(table: &berg_core::view::Table) -> Vec<MarkdownTableColumn> {
+    let mut columns = Vec::new();
+
+    for index in 0..table.columns.len() {
+        if is_bytes_table_column(table, index) {
+            columns.push(MarkdownTableColumn::Bytes(index));
+            columns.push(MarkdownTableColumn::BinarySize(index));
+        } else {
+            columns.push(MarkdownTableColumn::Source(index));
+        }
+    }
+
+    columns
+}
+
+fn render_table_header_markdown(
+    table: &berg_core::view::Table,
+    column: MarkdownTableColumn,
+) -> String {
+    match column {
+        MarkdownTableColumn::Source(index) => table
+            .columns
+            .get(index)
+            .map_or_else(String::new, render_cell_markdown),
+        MarkdownTableColumn::Bytes(index) => render_bytes_table_header_markdown(table, index),
+        MarkdownTableColumn::BinarySize(index) => {
+            render_binary_size_table_header_markdown(table, index)
+        }
+    }
+}
+
+fn render_bytes_table_header_markdown(
+    table: &berg_core::view::Table,
+    column_index: usize,
+) -> String {
+    let label = table
+        .columns
+        .get(column_index)
+        .map_or_else(String::new, render_cell_markdown);
+
+    if label == "Size" {
+        "Bytes".to_string()
+    } else {
+        format!("{label} (bytes)")
+    }
+}
+
+fn render_binary_size_table_header_markdown(
+    table: &berg_core::view::Table,
+    column_index: usize,
+) -> String {
+    let label = table
+        .columns
+        .get(column_index)
+        .map_or_else(String::new, render_cell_markdown);
+
+    if label == "Size" {
+        "Binary size".to_string()
+    } else {
+        format!("{label} (binary)")
+    }
+}
+
+fn render_table_cell_markdown(row: &berg_core::view::Row, column: MarkdownTableColumn) -> String {
+    match column {
+        MarkdownTableColumn::Source(index) => row
+            .cells
+            .get(index)
+            .map_or_else(String::new, render_cell_markdown),
+        MarkdownTableColumn::Bytes(index) => row
+            .cells
+            .get(index)
+            .map_or_else(String::new, render_bytes_table_cell_markdown),
+        MarkdownTableColumn::BinarySize(index) => row
+            .cells
+            .get(index)
+            .map_or_else(String::new, render_binary_size_table_cell_markdown),
+    }
+}
+
+fn render_bytes_table_cell_markdown(cell: &Cell) -> String {
+    match cell.values.as_slice() {
+        [DocumentValue::Bytes(value)] => format!("`{}`", format_u64(*value)),
+        _ => render_cell_markdown(cell),
+    }
+}
+
+fn render_binary_size_table_cell_markdown(cell: &Cell) -> String {
+    match cell.values.as_slice() {
+        [DocumentValue::Bytes(value)] => render_binary_size_markdown(*value),
+        _ => render_cell_markdown(cell),
+    }
+}
+
+fn is_right_aligned_markdown_table_column(
+    table: &berg_core::view::Table,
+    column: MarkdownTableColumn,
+) -> bool {
+    match column {
+        MarkdownTableColumn::Source(index) => is_right_aligned_table_column(table, index),
+        MarkdownTableColumn::Bytes(_) | MarkdownTableColumn::BinarySize(_) => true,
+    }
+}
+
+fn is_right_aligned_table_column(table: &berg_core::view::Table, column_index: usize) -> bool {
+    !table.rows.is_empty()
+        && table.rows.iter().all(|row| {
+            row.cells
+                .get(column_index)
+                .is_some_and(is_numeric_table_cell)
+        })
+}
+
+fn is_numeric_table_cell(cell: &Cell) -> bool {
+    match cell.values.as_slice() {
+        [
+            DocumentValue::Number(_)
+            | DocumentValue::Unsigned(_)
+            | DocumentValue::Bytes(_)
+            | DocumentValue::PercentageMillis(_)
+            | DocumentValue::Count(_),
+        ] => true,
+        [DocumentValue::Text(value)] if value == "n/a" => true,
+        _ => false,
+    }
+}
+
+fn is_bytes_table_column(table: &berg_core::view::Table, column_index: usize) -> bool {
+    !table.rows.is_empty()
+        && table.rows.iter().all(|row| {
+            row.cells
+                .get(column_index)
+                .is_some_and(is_bytes_or_na_table_cell)
+        })
+}
+
+fn is_bytes_or_na_table_cell(cell: &Cell) -> bool {
+    match cell.values.as_slice() {
+        [DocumentValue::Bytes(_)] => true,
+        [DocumentValue::Text(value)] if value == "n/a" => true,
+        _ => false,
     }
 }
 
@@ -572,6 +800,14 @@ fn render_bytes_markdown(value: u64) -> String {
     };
 
     format!("`{bytes}` bytes (`{scaled} {unit}`)")
+}
+
+fn render_binary_size_markdown(value: u64) -> String {
+    let Some((scaled, unit)) = binary_size(value) else {
+        return format!("`{}` bytes", format_u64(value));
+    };
+
+    format!("`{scaled} {unit}`")
 }
 
 fn binary_size(value: u64) -> Option<(String, &'static str)> {
@@ -727,6 +963,7 @@ mod tests {
                                 Cell::text("Type"),
                                 Cell::text("Required"),
                                 Cell::text("Field ID"),
+                                Cell::text("Size"),
                             ],
                             rows: vec![Row {
                                 cells: vec![
@@ -734,6 +971,7 @@ mod tests {
                                     Cell::code("map<string, string>"),
                                     Cell::value(DocumentValue::Bool(false)),
                                     Cell::value(DocumentValue::Number(36)),
+                                    Cell::value(DocumentValue::Bytes(2048)),
                                 ],
                             }],
                         }),
@@ -777,7 +1015,11 @@ mod tests {
         assert!(markdown.contains("- Identifier fields: `org_id`, `_key`"));
         assert!(markdown.contains("## Fields"));
         assert!(markdown.contains("### Nested"));
-        assert!(markdown.contains("| `metadata.labels` | `map<string, string>` | no | `36` |"));
+        assert!(markdown.contains("| Path | Type | Required | Field ID | Bytes | Binary size |"));
+        assert!(markdown.contains("| --- | --- | --- | ---: | ---: | ---: |"));
+        assert!(markdown.contains(
+            "| `metadata.labels` | `map<string, string>` | no | `36` | `2,048` | `2.000 KiB` |"
+        ));
         assert!(markdown.contains("1. Load table metadata"));
         assert!(markdown.contains("2. Derive schema view"));
         assert!(markdown.contains("   - Flatten nested fields"));

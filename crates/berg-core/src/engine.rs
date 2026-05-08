@@ -153,6 +153,38 @@ pub struct CurrentTableStats {
     pub metadata_json_size_bytes: u64,
 }
 
+/// Data file size statistics for the current Iceberg table snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentDataFileSizeStats {
+    /// Snapshot these statistics were computed from.
+    pub snapshot_id: i64,
+    /// Snapshot commit/update timestamp.
+    pub snapshot_updated_at: OffsetDateTime,
+    /// Current snapshot manifest list location.
+    pub manifest_list_path: String,
+    /// Number of live data files.
+    pub data_file_count: u64,
+    /// Average live data file size, rounded to the nearest byte.
+    pub avg_data_file_size_bytes: Option<u64>,
+    /// Distribution of live data file sizes.
+    pub distribution: Option<DataFileSizeDistribution>,
+}
+
+/// Percentile distribution for a set of data file sizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataFileSizeDistribution {
+    /// Smallest data file size.
+    pub min: u64,
+    /// 25th percentile data file size.
+    pub p25: u64,
+    /// 50th percentile data file size.
+    pub p50: u64,
+    /// 75th percentile data file size.
+    pub p75: u64,
+    /// Largest data file size.
+    pub max: u64,
+}
+
 impl RestCatalogConfig {
     /// Build a REST catalog config.
     ///
@@ -274,12 +306,7 @@ pub async fn load_current_table_stats(
     let manifest_list = snapshot
         .load_manifest_list(table.file_io(), &table.metadata_ref())
         .await?;
-    let snapshot_updated_at =
-        OffsetDateTime::from_unix_timestamp_nanos(i128::from(snapshot.timestamp_ms()) * 1_000_000)
-            .map_err(|_| BergError::InvalidSnapshotTimestamp {
-                snapshot_id: snapshot.snapshot_id(),
-                timestamp_ms: snapshot.timestamp_ms(),
-            })?;
+    let snapshot_updated_at = snapshot_updated_at(snapshot.snapshot_id(), snapshot.timestamp_ms())?;
     let mut stats = CurrentTableStats {
         snapshot_id: snapshot.snapshot_id(),
         snapshot_updated_at,
@@ -344,6 +371,117 @@ pub async fn load_current_table_stats(
     }
 
     Ok(stats)
+}
+
+/// Load current snapshot data file size statistics for a table through an Iceberg REST catalog.
+///
+/// # Errors
+///
+/// Returns an Iceberg-backed error when catalog, metadata, or manifest reads
+/// fail. Returns [`BergError::NoCurrentSnapshot`] when the table has no current
+/// snapshot.
+pub async fn load_current_data_file_size_stats(
+    config: &RestCatalogConfig,
+    table_ident: &TableIdent,
+) -> Result<CurrentDataFileSizeStats> {
+    let table = load_table(config, table_ident).await?;
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .current_snapshot()
+        .ok_or_else(|| BergError::NoCurrentSnapshot {
+            table: table_ident.to_string(),
+        })?;
+    let manifest_list_path = snapshot.manifest_list().to_string();
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await?;
+    let snapshot_updated_at = snapshot_updated_at(snapshot.snapshot_id(), snapshot.timestamp_ms())?;
+    let mut data_file_sizes = Vec::new();
+
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.content != ManifestContentType::Data {
+            continue;
+        }
+
+        if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
+            continue;
+        }
+
+        let manifest = manifest_file.load_manifest(table.file_io()).await?;
+        data_file_sizes.extend(
+            manifest
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_alive() && entry.content_type() == DataContentType::Data)
+                .map(|entry| entry.file_size_in_bytes()),
+        );
+    }
+
+    data_file_sizes.sort_unstable();
+    let data_file_count = data_file_sizes.len() as u64;
+    let avg_data_file_size_bytes = rounded_average(&data_file_sizes);
+    let distribution = data_file_size_distribution(&data_file_sizes);
+
+    Ok(CurrentDataFileSizeStats {
+        snapshot_id: snapshot.snapshot_id(),
+        snapshot_updated_at,
+        manifest_list_path,
+        data_file_count,
+        avg_data_file_size_bytes,
+        distribution,
+    })
+}
+
+fn snapshot_updated_at(snapshot_id: i64, timestamp_ms: i64) -> Result<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp_ms) * 1_000_000).map_err(|_| {
+        BergError::InvalidSnapshotTimestamp {
+            snapshot_id,
+            timestamp_ms,
+        }
+    })
+}
+
+fn rounded_average(values: &[u64]) -> Option<u64> {
+    let count = values.len() as u128;
+    if count == 0 {
+        return None;
+    }
+
+    let total = values
+        .iter()
+        .fold(0_u128, |total, value| total + u128::from(*value));
+    let average = (total + count / 2) / count;
+
+    Some(average.min(u128::from(u64::MAX)) as u64)
+}
+
+fn data_file_size_distribution(sorted_values: &[u64]) -> Option<DataFileSizeDistribution> {
+    Some(DataFileSizeDistribution {
+        min: *sorted_values.first()?,
+        p25: percentile(sorted_values, 1, 4),
+        p50: percentile(sorted_values, 1, 2),
+        p75: percentile(sorted_values, 3, 4),
+        max: *sorted_values.last()?,
+    })
+}
+
+fn percentile(sorted_values: &[u64], numerator: usize, denominator: usize) -> u64 {
+    debug_assert!(!sorted_values.is_empty());
+    debug_assert!(denominator > 0);
+
+    let last_index = sorted_values.len() - 1;
+    let scaled_index = last_index * numerator;
+    let lower_index = scaled_index / denominator;
+    let upper_index = lower_index.saturating_add(1).min(last_index);
+    let remainder = scaled_index % denominator;
+    let lower_value = u128::from(sorted_values[lower_index]);
+    let upper_value = u128::from(sorted_values[upper_index]);
+    let denominator = denominator as u128;
+    let remainder = remainder as u128;
+    let interpolated =
+        lower_value * denominator + (upper_value - lower_value) * remainder + denominator / 2;
+
+    (interpolated / denominator).min(u128::from(u64::MAX)) as u64
 }
 
 fn is_compressed_metadata_json(path: &str) -> bool {
@@ -502,7 +640,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        QualifiedTableIdent, RestCatalogConfig, credential_from_env_output, parse_catalog_property,
+        DataFileSizeDistribution, QualifiedTableIdent, RestCatalogConfig,
+        credential_from_env_output, data_file_size_distribution, parse_catalog_property,
+        rounded_average,
     };
 
     #[test]
@@ -571,5 +711,29 @@ AWS_SESSION_TOKEN='token'
         assert_eq!("access", credential.access_key_id);
         assert_eq!("secret", credential.secret_access_key);
         assert_eq!(Some("token".to_string()), credential.session_token);
+    }
+
+    #[test]
+    fn computes_data_file_size_distribution() {
+        let sizes = [100, 200, 300, 400, 500];
+
+        let distribution = data_file_size_distribution(&sizes).expect("distribution");
+
+        assert_eq!(
+            DataFileSizeDistribution {
+                min: 100,
+                p25: 200,
+                p50: 300,
+                p75: 400,
+                max: 500,
+            },
+            distribution
+        );
+    }
+
+    #[test]
+    fn computes_rounded_data_file_size_average() {
+        assert_eq!(Some(151), rounded_average(&[100, 201]));
+        assert_eq!(None, rounded_average(&[]));
     }
 }

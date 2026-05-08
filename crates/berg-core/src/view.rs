@@ -34,7 +34,7 @@
 use std::borrow::Borrow;
 use std::collections::HashSet;
 
-use crate::engine::CurrentTableStats;
+use crate::engine::{CurrentDataFileSizeStats, CurrentTableStats, DataFileSizeDistribution};
 use crate::spec::{NestedFieldRef, Schema, Type};
 use time::OffsetDateTime;
 
@@ -332,6 +332,123 @@ pub fn table_stats_document(
     }
 }
 
+/// Build a semantic document view from current Iceberg data file size statistics.
+#[must_use]
+pub fn data_file_size_stats_document(
+    table_ident: impl Into<String>,
+    source_endpoint: impl Into<String>,
+    retrieved_at: OffsetDateTime,
+    stats: &CurrentDataFileSizeStats,
+) -> Document {
+    let table_ident = table_ident.into();
+
+    Document {
+        title: Cell::new(vec![
+            DocumentValue::Text("Data File Size Stats: ".to_string()),
+            DocumentValue::Code(table_ident),
+        ]),
+        blocks: vec![
+            Block::Properties(data_file_size_stats_header_properties(
+                source_endpoint.into(),
+                retrieved_at,
+                stats,
+            )),
+            Block::Section(Section {
+                title: Cell::text("Data File Sizes"),
+                blocks: vec![
+                    Block::Properties(data_file_size_properties(stats)),
+                    Block::Table(data_file_size_distribution_table(
+                        stats.distribution.as_ref(),
+                    )),
+                ],
+            }),
+        ],
+    }
+}
+
+fn data_file_size_stats_header_properties(
+    source_endpoint: String,
+    retrieved_at: OffsetDateTime,
+    stats: &CurrentDataFileSizeStats,
+) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Source endpoint".to_string(),
+            value: Cell::value(DocumentValue::Uri(source_endpoint)),
+        },
+        Property {
+            label: "Retrieved at".to_string(),
+            value: utc_and_local_timestamp_cell(retrieved_at),
+        },
+        Property {
+            label: "Snapshot ID".to_string(),
+            value: Cell::value(DocumentValue::Number(stats.snapshot_id)),
+        },
+        Property {
+            label: "Updated at".to_string(),
+            value: utc_and_local_timestamp_cell(stats.snapshot_updated_at),
+        },
+        Property {
+            label: "Manifest list".to_string(),
+            value: Cell::value(DocumentValue::Uri(stats.manifest_list_path.clone())),
+        },
+    ]
+}
+
+fn data_file_size_properties(stats: &CurrentDataFileSizeStats) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Data files".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(stats.data_file_count)),
+        },
+        Property {
+            label: "Average data file size".to_string(),
+            value: optional_bytes_cell(stats.avg_data_file_size_bytes),
+        },
+    ]
+}
+
+fn data_file_size_distribution_table(distribution: Option<&DataFileSizeDistribution>) -> Table {
+    Table {
+        columns: vec![Cell::text("Statistic"), Cell::text("Size")],
+        rows: vec![
+            data_file_size_distribution_row(
+                "min",
+                distribution.map(|distribution| distribution.min),
+            ),
+            data_file_size_distribution_row(
+                "p25",
+                distribution.map(|distribution| distribution.p25),
+            ),
+            data_file_size_distribution_row(
+                "p50",
+                distribution.map(|distribution| distribution.p50),
+            ),
+            data_file_size_distribution_row(
+                "p75",
+                distribution.map(|distribution| distribution.p75),
+            ),
+            data_file_size_distribution_row(
+                "max",
+                distribution.map(|distribution| distribution.max),
+            ),
+        ],
+    }
+}
+
+fn data_file_size_distribution_row(label: &str, size_bytes: Option<u64>) -> Row {
+    Row {
+        cells: vec![Cell::text(label), optional_bytes_cell(size_bytes)],
+    }
+}
+
+fn optional_bytes_cell(size_bytes: Option<u64>) -> Cell {
+    size_bytes.map_or_else(
+        || Cell::text("n/a"),
+        |size| Cell::value(DocumentValue::Bytes(size)),
+    )
+}
+
 fn table_stats_header_properties(
     source_endpoint: String,
     retrieved_at: OffsetDateTime,
@@ -572,13 +689,16 @@ fn type_summary(field_type: &Type) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::CurrentTableStats;
+    use crate::engine::{CurrentDataFileSizeStats, CurrentTableStats, DataFileSizeDistribution};
     use crate::spec::{
         ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type,
     };
     use time::OffsetDateTime;
 
-    use super::{Block, Cell, DocumentValue, schema_document, table_stats_document};
+    use super::{
+        Block, Cell, DocumentValue, data_file_size_stats_document, schema_document,
+        table_stats_document,
+    };
 
     fn nested_schema() -> Schema {
         Schema::builder()
@@ -862,6 +982,75 @@ mod tests {
                 DocumentValue::Text(" of table file size".to_string())
             ]),
             metadata_file_properties[5].value
+        );
+    }
+
+    #[test]
+    fn builds_data_file_size_stats_document() {
+        let stats = CurrentDataFileSizeStats {
+            snapshot_id: 42,
+            snapshot_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
+                .expect("valid timestamp"),
+            manifest_list_path: "s3://warehouse/table/metadata/snap-42.avro".to_string(),
+            data_file_count: 5,
+            avg_data_file_size_bytes: Some(300),
+            distribution: Some(DataFileSizeDistribution {
+                min: 100,
+                p25: 200,
+                p50: 300,
+                p75: 400,
+                max: 500,
+            }),
+        };
+
+        let document = data_file_size_stats_document(
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
+            &stats,
+        );
+
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Text("Data File Size Stats: ".to_string()),
+                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+            ]),
+            document.title
+        );
+
+        let Block::Properties(properties) = &document.blocks[0] else {
+            panic!("first block should be properties");
+        };
+        assert_eq!("Snapshot ID", properties[2].label);
+        assert_eq!("Manifest list", properties[4].label);
+
+        let Block::Section(data_file_sizes) = &document.blocks[1] else {
+            panic!("second block should be data file sizes section");
+        };
+        let Block::Properties(size_properties) = &data_file_sizes.blocks[0] else {
+            panic!("data file sizes section should contain properties");
+        };
+        assert_eq!("Data files", size_properties[0].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Unsigned(5)),
+            size_properties[0].value
+        );
+        assert_eq!("Average data file size", size_properties[1].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Bytes(300)),
+            size_properties[1].value
+        );
+
+        let Block::Table(distribution_table) = &data_file_sizes.blocks[1] else {
+            panic!("data file sizes section should contain a table");
+        };
+        assert_eq!(
+            vec![Cell::text("Statistic"), Cell::text("Size")],
+            distribution_table.columns
+        );
+        assert_eq!(
+            vec![Cell::text("p50"), Cell::value(DocumentValue::Bytes(300))],
+            distribution_table.rows[2].cells
         );
     }
 }

@@ -20,7 +20,7 @@
 //! Frontend crates do **not** depend on the catalog or storage crates
 //! directly; backend selection is a `berg-core` concern.
 //!
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
@@ -164,6 +164,8 @@ pub struct CurrentDataFileSizeStats {
     pub manifest_list_path: String,
     /// Target data file size from table properties, or Iceberg's default.
     pub target_file_size_bytes: u64,
+    /// Total bytes across live data files.
+    pub total_data_file_size_bytes: u64,
     /// Number of live data files.
     pub data_file_count: u64,
     /// Average live data file size, rounded to the nearest byte.
@@ -171,6 +173,48 @@ pub struct CurrentDataFileSizeStats {
     /// Distribution of live data file sizes.
     pub distribution: Option<DataFileSizeDistribution>,
     /// Data file size bucket summaries.
+    pub buckets: Vec<DataFileSizeBucketStats>,
+}
+
+/// Current snapshot partition layout and per-partition data file statistics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentTablePartitions {
+    /// Snapshot these statistics were computed from.
+    pub snapshot_id: i64,
+    /// Snapshot commit/update timestamp.
+    pub snapshot_updated_at: OffsetDateTime,
+    /// Current table metadata JSON location.
+    pub metadata_json_path: String,
+    /// Current snapshot manifest list location.
+    pub manifest_list_path: String,
+    /// Current table schema used to describe the default partition spec.
+    pub current_schema: spec::SchemaRef,
+    /// Default partition spec for new writes.
+    pub partition_spec: spec::PartitionSpecRef,
+    /// Target data file size from table properties, or Iceberg's default.
+    pub target_file_size_bytes: u64,
+    /// Total bytes across live data files.
+    pub total_data_file_size_bytes: u64,
+    /// Number of live data files.
+    pub data_file_count: u64,
+    /// Data file size bucket labels, matching table data file size statistics.
+    pub bucket_labels: Vec<String>,
+    /// Live data files grouped by partition spec ID and partition value.
+    pub partitions: Vec<CurrentTablePartitionStats>,
+}
+
+/// Data file statistics for one current snapshot partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentTablePartitionStats {
+    /// Partition spec ID used to write files in this partition.
+    pub partition_spec_id: i32,
+    /// Human-readable partition path, or `unpartitioned` for unpartitioned specs.
+    pub partition: String,
+    /// Number of live data files in this partition.
+    pub file_count: u64,
+    /// Total bytes across live data files in this partition.
+    pub total_size_bytes: u64,
+    /// Data file size bucket summaries for this partition.
     pub buckets: Vec<DataFileSizeBucketStats>,
 }
 
@@ -327,6 +371,7 @@ pub async fn load_current_table_stats(
     let manifest_list = snapshot
         .load_manifest_list(table.file_io(), &table.metadata_ref())
         .await?;
+    let manifest_files_size_bytes = manifest_files_size_bytes(manifest_list.entries())?;
     let snapshot_updated_at = snapshot_updated_at(snapshot.snapshot_id(), snapshot.timestamp_ms())?;
     let mut stats = CurrentTableStats {
         snapshot_id: snapshot.snapshot_id(),
@@ -343,53 +388,38 @@ pub async fn load_current_table_stats(
         record_count: 0,
         manifest_file_count: manifest_list.entries().len() as u64,
         manifest_list_size_bytes,
-        manifest_files_size_bytes: 0,
+        manifest_files_size_bytes,
         metadata_json_size_bytes,
     };
 
-    for manifest_file in manifest_list.entries() {
-        stats.manifest_files_size_bytes +=
-            u64::try_from(manifest_file.manifest_length).map_err(|_| {
-                BergError::InvalidManifestLength {
-                    path: manifest_file.manifest_path.clone(),
-                    length: manifest_file.manifest_length,
-                }
-            })?;
+    visit_live_manifest_files(
+        &table,
+        &manifest_list,
+        |_| true,
+        |live_manifest| {
+            for entry in live_manifest_entries(&live_manifest.manifest) {
+                stats.total_table_file_size_bytes += entry.file_size_in_bytes();
 
-        if manifest_file.content == ManifestContentType::Data
-            && !manifest_file.has_added_files()
-            && !manifest_file.has_existing_files()
-        {
-            continue;
-        }
-
-        if manifest_file.content == ManifestContentType::Deletes
-            && !manifest_file.has_added_files()
-            && !manifest_file.has_existing_files()
-        {
-            continue;
-        }
-
-        let manifest = manifest_file.load_manifest(table.file_io()).await?;
-        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
-            stats.total_table_file_size_bytes += entry.file_size_in_bytes();
-
-            match entry.content_type() {
-                DataContentType::Data => {
-                    stats.data_file_count += 1;
-                    stats.record_count += entry.record_count();
-                }
-                DataContentType::PositionDeletes => {
-                    stats.position_delete_file_count += 1;
-                    stats.position_delete_record_count += entry.record_count();
-                }
-                DataContentType::EqualityDeletes => {
-                    stats.equality_delete_file_count += 1;
-                    stats.equality_delete_record_count += entry.record_count();
+                match entry.content_type() {
+                    DataContentType::Data => {
+                        stats.data_file_count += 1;
+                        stats.record_count += entry.record_count();
+                    }
+                    DataContentType::PositionDeletes => {
+                        stats.position_delete_file_count += 1;
+                        stats.position_delete_record_count += entry.record_count();
+                    }
+                    DataContentType::EqualityDeletes => {
+                        stats.equality_delete_file_count += 1;
+                        stats.equality_delete_record_count += entry.record_count();
+                    }
                 }
             }
-        }
-    }
+
+            Ok(())
+        },
+    )
+    .await?;
 
     Ok(stats)
 }
@@ -420,27 +450,24 @@ pub async fn load_current_data_file_size_stats(
     let target_file_size_bytes = target_file_size_bytes(metadata.properties());
     let mut data_file_sizes = Vec::new();
 
-    for manifest_file in manifest_list.entries() {
-        if manifest_file.content != ManifestContentType::Data {
-            continue;
-        }
+    visit_live_manifest_files(
+        &table,
+        &manifest_list,
+        |content| content == ManifestContentType::Data,
+        |live_manifest| {
+            data_file_sizes.extend(
+                live_data_file_entries(&live_manifest.manifest)
+                    .map(spec::ManifestEntry::file_size_in_bytes),
+            );
 
-        if !manifest_file.has_added_files() && !manifest_file.has_existing_files() {
-            continue;
-        }
-
-        let manifest = manifest_file.load_manifest(table.file_io()).await?;
-        data_file_sizes.extend(
-            manifest
-                .entries()
-                .iter()
-                .filter(|entry| entry.is_alive() && entry.content_type() == DataContentType::Data)
-                .map(|entry| entry.file_size_in_bytes()),
-        );
-    }
+            Ok(())
+        },
+    )
+    .await?;
 
     data_file_sizes.sort_unstable();
     let data_file_count = data_file_sizes.len() as u64;
+    let total_data_file_size_bytes = total_size_bytes(&data_file_sizes);
     let avg_data_file_size_bytes = rounded_average(&data_file_sizes);
     let distribution = data_file_size_distribution(&data_file_sizes);
     let buckets = data_file_size_buckets(&data_file_sizes, target_file_size_bytes);
@@ -450,11 +477,229 @@ pub async fn load_current_data_file_size_stats(
         snapshot_updated_at,
         manifest_list_path,
         target_file_size_bytes,
+        total_data_file_size_bytes,
         data_file_count,
         avg_data_file_size_bytes,
         distribution,
         buckets,
     })
+}
+
+/// Load the current partition spec and current snapshot per-partition file statistics.
+///
+/// # Errors
+///
+/// Returns an Iceberg-backed error when catalog, metadata, or manifest reads
+/// fail. Returns [`BergError::NoCurrentSnapshot`] when the table has no current
+/// snapshot.
+pub async fn load_current_table_partitions(
+    config: &RestCatalogConfig,
+    table_ident: &TableIdent,
+) -> Result<CurrentTablePartitions> {
+    let table = load_table(config, table_ident).await?;
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .current_snapshot()
+        .ok_or_else(|| BergError::NoCurrentSnapshot {
+            table: table_ident.to_string(),
+        })?;
+    let metadata_json_path = table.metadata_location_result()?.to_string();
+    let manifest_list_path = snapshot.manifest_list().to_string();
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await?;
+    let snapshot_updated_at = snapshot_updated_at(snapshot.snapshot_id(), snapshot.timestamp_ms())?;
+    let current_schema = metadata.current_schema().clone();
+    let partition_spec = metadata.default_partition_spec().clone();
+    let target_file_size_bytes = target_file_size_bytes(metadata.properties());
+    let bucket_labels = data_file_size_bucket_specs(target_file_size_bytes)
+        .into_iter()
+        .map(|bucket| bucket.label)
+        .collect::<Vec<_>>();
+    let mut partition_accumulators = BTreeMap::<(i32, String), PartitionAccumulator>::new();
+    let mut data_file_count = 0_u64;
+    let mut total_data_file_size_bytes = 0_u64;
+
+    visit_live_manifest_files(
+        &table,
+        &manifest_list,
+        |content| content == ManifestContentType::Data,
+        |live_manifest| {
+            let manifest_spec = live_manifest.manifest.metadata().partition_spec();
+            let manifest_schema = live_manifest.manifest.metadata().schema();
+            let partition_type = manifest_spec.partition_type(manifest_schema)?;
+
+            for entry in live_data_file_entries(&live_manifest.manifest) {
+                let file_size_bytes = entry.file_size_in_bytes();
+                let partition = partition_path(
+                    manifest_spec,
+                    &partition_type,
+                    entry.data_file().partition(),
+                );
+
+                data_file_count += 1;
+                total_data_file_size_bytes =
+                    total_data_file_size_bytes.saturating_add(file_size_bytes);
+                partition_accumulators
+                    .entry((live_manifest.partition_spec_id, partition))
+                    .or_default()
+                    .add_file(file_size_bytes);
+            }
+
+            Ok(())
+        },
+    )
+    .await?;
+
+    let partitions =
+        partition_stats_from_accumulators(partition_accumulators, target_file_size_bytes);
+
+    Ok(CurrentTablePartitions {
+        snapshot_id: snapshot.snapshot_id(),
+        snapshot_updated_at,
+        metadata_json_path,
+        manifest_list_path,
+        current_schema,
+        partition_spec,
+        target_file_size_bytes,
+        total_data_file_size_bytes,
+        data_file_count,
+        bucket_labels,
+        partitions,
+    })
+}
+
+struct LiveManifest {
+    partition_spec_id: i32,
+    manifest: spec::Manifest,
+}
+
+async fn visit_live_manifest_files<F, V>(
+    table: &Table,
+    manifest_list: &spec::ManifestList,
+    include_content: F,
+    mut visit: V,
+) -> Result<()>
+where
+    F: Fn(ManifestContentType) -> bool,
+    V: FnMut(LiveManifest) -> Result<()>,
+{
+    for manifest_file in manifest_list.entries() {
+        if !include_content(manifest_file.content) || !manifest_file_has_live_files(manifest_file) {
+            continue;
+        }
+
+        visit(LiveManifest {
+            partition_spec_id: manifest_file.partition_spec_id,
+            manifest: manifest_file.load_manifest(table.file_io()).await?,
+        })?;
+    }
+
+    Ok(())
+}
+
+fn manifest_file_has_live_files(manifest_file: &spec::ManifestFile) -> bool {
+    manifest_file.has_added_files() || manifest_file.has_existing_files()
+}
+
+fn live_manifest_entries(
+    manifest: &spec::Manifest,
+) -> impl Iterator<Item = &spec::ManifestEntry> + '_ {
+    manifest
+        .entries()
+        .iter()
+        .map(std::convert::AsRef::as_ref)
+        .filter(|entry| entry.is_alive())
+}
+
+fn live_data_file_entries(
+    manifest: &spec::Manifest,
+) -> impl Iterator<Item = &spec::ManifestEntry> + '_ {
+    live_manifest_entries(manifest).filter(|entry| entry.content_type() == DataContentType::Data)
+}
+
+fn manifest_files_size_bytes(manifest_files: &[spec::ManifestFile]) -> Result<u64> {
+    manifest_files
+        .iter()
+        .try_fold(0_u64, |total, manifest_file| {
+            let manifest_length = u64::try_from(manifest_file.manifest_length).map_err(|_| {
+                BergError::InvalidManifestLength {
+                    path: manifest_file.manifest_path.clone(),
+                    length: manifest_file.manifest_length,
+                }
+            })?;
+
+            Ok(total.saturating_add(manifest_length))
+        })
+}
+
+fn partition_stats_from_accumulators(
+    partition_accumulators: BTreeMap<(i32, String), PartitionAccumulator>,
+    target_file_size_bytes: u64,
+) -> Vec<CurrentTablePartitionStats> {
+    partition_accumulators
+        .into_iter()
+        .map(|((partition_spec_id, partition), mut accumulator)| {
+            accumulator.file_sizes.sort_unstable();
+            let buckets = data_file_size_buckets(&accumulator.file_sizes, target_file_size_bytes);
+
+            CurrentTablePartitionStats {
+                partition_spec_id,
+                partition,
+                file_count: accumulator.file_sizes.len() as u64,
+                total_size_bytes: accumulator.total_size_bytes,
+                buckets,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct PartitionAccumulator {
+    file_sizes: Vec<u64>,
+    total_size_bytes: u64,
+}
+
+impl PartitionAccumulator {
+    fn add_file(&mut self, file_size_bytes: u64) {
+        self.file_sizes.push(file_size_bytes);
+        self.total_size_bytes = self.total_size_bytes.saturating_add(file_size_bytes);
+    }
+}
+
+fn partition_path(
+    partition_spec: &spec::PartitionSpec,
+    partition_type: &spec::StructType,
+    partition: &spec::Struct,
+) -> String {
+    if partition_spec.is_unpartitioned() {
+        return "unpartitioned".to_string();
+    }
+
+    let field_types = partition_type.fields();
+    let mut path_parts = Vec::with_capacity(partition_spec.fields().len());
+    for (index, field) in partition_spec.fields().iter().enumerate() {
+        path_parts.push(format!(
+            "{}={}",
+            field.name,
+            field
+                .transform
+                .to_human_string(&field_types[index].field_type, partition[index].as_ref())
+        ));
+    }
+
+    let partition_path = path_parts.join("/");
+    if partition_path.is_empty() {
+        "unpartitioned".to_string()
+    } else {
+        partition_path
+    }
+}
+
+fn total_size_bytes(values: &[u64]) -> u64 {
+    values
+        .iter()
+        .fold(0_u64, |total, size| total.saturating_add(*size))
 }
 
 fn target_file_size_bytes(properties: &HashMap<String, String>) -> u64 {
@@ -485,7 +730,11 @@ fn rounded_average(values: &[u64]) -> Option<u64> {
         .fold(0_u128, |total, value| total + u128::from(*value));
     let average = (total + count / 2) / count;
 
-    Some(average.min(u128::from(u64::MAX)) as u64)
+    Some(u128_to_u64_saturating(average))
+}
+
+fn u128_to_u64_saturating(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn data_file_size_distribution(sorted_values: &[u64]) -> Option<DataFileSizeDistribution> {
@@ -504,9 +753,7 @@ fn data_file_size_buckets(
     target_file_size_bytes: u64,
 ) -> Vec<DataFileSizeBucketStats> {
     let total_file_count = sorted_values.len() as u64;
-    let total_size_bytes = sorted_values
-        .iter()
-        .fold(0_u64, |total, size| total.saturating_add(*size));
+    let total_size_bytes = total_size_bytes(sorted_values);
     let bucket_specs = data_file_size_bucket_specs(target_file_size_bytes);
     let mut buckets = bucket_specs
         .iter()
@@ -559,18 +806,34 @@ impl DataFileSizeBucketSpec {
 fn data_file_size_bucket_specs(target_file_size_bytes: u64) -> Vec<DataFileSizeBucketSpec> {
     const MIB: u64 = 1024 * 1024;
 
-    let target_25 = target_file_size_bytes / 4;
-    let target_75 = target_file_size_bytes.saturating_mul(3) / 4;
-    let target_125 = target_file_size_bytes.saturating_mul(5) / 4;
-    let target_200 = target_file_size_bytes.saturating_mul(2);
+    let below_target_start = target_file_size_bytes / 4;
+    let near_target_start = target_file_size_bytes.saturating_mul(3) / 4;
+    let above_target_start = target_file_size_bytes.saturating_mul(5) / 4;
+    let oversized_start = target_file_size_bytes.saturating_mul(2);
     let candidates = [
         ("< 16 MiB".to_string(), 0, Some(16 * MIB)),
         ("16-64 MiB".to_string(), 16 * MIB, Some(64 * MIB)),
-        ("64 MiB-25% target".to_string(), 64 * MIB, Some(target_25)),
-        ("25-75% target".to_string(), target_25, Some(target_75)),
-        ("75-125% target".to_string(), target_75, Some(target_125)),
-        ("125-200% target".to_string(), target_125, Some(target_200)),
-        ("> 200% target".to_string(), target_200, None),
+        (
+            "64 MiB-25% target".to_string(),
+            64 * MIB,
+            Some(below_target_start),
+        ),
+        (
+            "25-75% target".to_string(),
+            below_target_start,
+            Some(near_target_start),
+        ),
+        (
+            "75-125% target".to_string(),
+            near_target_start,
+            Some(above_target_start),
+        ),
+        (
+            "125-200% target".to_string(),
+            above_target_start,
+            Some(oversized_start),
+        ),
+        ("> 200% target".to_string(), oversized_start, None),
     ];
 
     candidates
@@ -599,7 +862,7 @@ fn ratio_percentage_millis(numerator: u64, denominator: u64) -> u64 {
     let denominator = u128::from(denominator);
     let rounded = (numerator * 100_000 + denominator / 2) / denominator;
 
-    rounded.min(u128::from(u64::MAX)) as u64
+    u128_to_u64_saturating(rounded)
 }
 
 fn percentile(sorted_values: &[u64], numerator: usize, denominator: usize) -> u64 {
@@ -618,7 +881,7 @@ fn percentile(sorted_values: &[u64], numerator: usize, denominator: usize) -> u6
     let interpolated =
         lower_value * denominator + (upper_value - lower_value) * remainder + denominator / 2;
 
-    (interpolated / denominator).min(u128::from(u64::MAX)) as u64
+    u128_to_u64_saturating(interpolated / denominator)
 }
 
 fn is_compressed_metadata_json(path: &str) -> bool {
@@ -774,12 +1037,18 @@ pub fn parse_catalog_property(value: &str) -> Result<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    use crate::spec::{
+        Literal, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType, Schema, Struct,
+        Transform, Type,
+    };
 
     use super::{
-        DataFileSizeDistribution, QualifiedTableIdent, RestCatalogConfig,
+        DataFileSizeDistribution, PartitionAccumulator, QualifiedTableIdent, RestCatalogConfig,
         credential_from_env_output, data_file_size_buckets, data_file_size_distribution,
-        parse_catalog_property, rounded_average,
+        parse_catalog_property, partition_path, partition_stats_from_accumulators, rounded_average,
     };
 
     #[test]
@@ -903,5 +1172,93 @@ AWS_SESSION_TOKEN='token'
         assert_eq!("> 200% target", buckets[6].label);
         assert_eq!(1, buckets[6].file_count);
         assert_eq!(1100 * mib, buckets[6].total_size_bytes);
+    }
+
+    #[test]
+    fn formats_unpartitioned_partition_path() {
+        let schema = partition_test_schema();
+        let partition_spec = PartitionSpec::unpartition_spec();
+        let partition_type = partition_spec
+            .partition_type(&schema)
+            .expect("valid partition type");
+
+        assert_eq!(
+            "unpartitioned",
+            partition_path(&partition_spec, &partition_type, &Struct::empty())
+        );
+    }
+
+    #[test]
+    fn formats_multi_field_partition_path() {
+        let schema = partition_test_schema();
+        let partition_spec = PartitionSpec::builder(Arc::new(schema.clone()))
+            .with_spec_id(7)
+            .add_partition_field("org_id", "org_id", Transform::Identity)
+            .expect("valid identity partition field")
+            .add_partition_field("day", "day_bucket", Transform::Bucket(16))
+            .expect("valid bucket partition field")
+            .add_partition_field("level", "level_prefix", Transform::Truncate(3))
+            .expect("valid truncate partition field")
+            .build()
+            .expect("valid partition spec");
+        let partition_type = partition_spec
+            .partition_type(&schema)
+            .expect("valid partition type");
+        let partition = Struct::from_iter([
+            Some(Literal::Primitive(PrimitiveLiteral::Long(123))),
+            Some(Literal::Primitive(PrimitiveLiteral::Int(7))),
+            Some(Literal::Primitive(PrimitiveLiteral::String(
+                "pro".to_string(),
+            ))),
+        ]);
+
+        assert_eq!(
+            "org_id=123/day_bucket=7/level_prefix=pro",
+            partition_path(&partition_spec, &partition_type, &partition)
+        );
+    }
+
+    #[test]
+    fn builds_partition_stats_grouped_by_spec_and_partition() {
+        let mib = 1024 * 1024;
+        let mut accumulators = BTreeMap::<(i32, String), PartitionAccumulator>::new();
+        accumulators
+            .entry((7, "org_id=123".to_string()))
+            .or_default()
+            .add_file(8 * mib);
+        accumulators
+            .entry((7, "org_id=123".to_string()))
+            .or_default()
+            .add_file(32 * mib);
+        accumulators
+            .entry((8, "org_id=123".to_string()))
+            .or_default()
+            .add_file(400 * mib);
+
+        let partitions = partition_stats_from_accumulators(accumulators, 512 * mib);
+
+        assert_eq!(2, partitions.len());
+        assert_eq!(7, partitions[0].partition_spec_id);
+        assert_eq!("org_id=123", partitions[0].partition);
+        assert_eq!(2, partitions[0].file_count);
+        assert_eq!(40 * mib, partitions[0].total_size_bytes);
+        assert_eq!(1, partitions[0].buckets[0].file_count);
+        assert_eq!(1, partitions[0].buckets[1].file_count);
+        assert_eq!(8, partitions[1].partition_spec_id);
+        assert_eq!("org_id=123", partitions[1].partition);
+        assert_eq!(1, partitions[1].file_count);
+        assert_eq!(400 * mib, partitions[1].total_size_bytes);
+        assert_eq!(1, partitions[1].buckets[4].file_count);
+    }
+
+    fn partition_test_schema() -> Schema {
+        Schema::builder()
+            .with_fields([
+                NestedField::required(1, "org_id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "day", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(3, "level", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .expect("valid schema")
     }
 }

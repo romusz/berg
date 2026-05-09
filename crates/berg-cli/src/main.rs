@@ -5,11 +5,11 @@ use std::fmt::Write;
 use anyhow::{Context, anyhow};
 use berg_core::engine::{
     QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats, load_current_schema,
-    load_current_table_stats, parse_catalog_property,
+    load_current_table_partitions, load_current_table_stats, parse_catalog_property,
 };
 use berg_core::view::{
     Block, Cell, Document, DocumentValue, List, ListKind, data_file_size_stats_document,
-    schema_document, table_stats_document,
+    schema_document, table_partitions_document, table_stats_document,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use time::format_description::well_known::Rfc3339;
@@ -149,6 +149,8 @@ struct TableArgs {
 enum TableCommands {
     /// Inspect Iceberg table files.
     Files(TableFilesArgs),
+    /// Inspect Iceberg table partitions.
+    Partitions(TablePartitionsArgs),
     /// Inspect Iceberg table statistics.
     Stats(TableStatsArgs),
 }
@@ -175,6 +177,27 @@ struct TableFilesDataArgs {
 enum TableFilesDataCommands {
     /// Show data file size statistics for the current snapshot of a fully-qualified table ID.
     Stats(DataFileSizeStatsArgs),
+}
+
+#[derive(Debug, Args)]
+struct TablePartitionsArgs {
+    #[command(subcommand)]
+    command: TablePartitionsCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum TablePartitionsCommands {
+    /// Show the current partition spec and current snapshot partitions for a fully-qualified table ID.
+    Current(CurrentTablePartitionsArgs),
+}
+
+#[derive(Debug, Args)]
+struct CurrentTablePartitionsArgs {
+    /// Fully-qualified table ID: catalog.namespace.table.
+    table: String,
+
+    #[command(flatten)]
+    output: DocumentOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -246,6 +269,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 },
             },
+            TableCommands::Partitions(partitions_args) => match partitions_args.command {
+                TablePartitionsCommands::Current(args) => {
+                    print_current_table_partitions(args, catalog_args).await?;
+                }
+            },
             TableCommands::Stats(stats_args) => match stats_args.command {
                 TableStatsCommands::Current(args) => {
                     print_current_table_stats(args, catalog_args).await?;
@@ -278,6 +306,33 @@ async fn print_current_schema(
         config.table_endpoint(table.table()),
         OffsetDateTime::now_utc(),
         schema,
+    );
+
+    print!("{}", render_document(&document, args.output.format)?);
+
+    Ok(())
+}
+
+async fn print_current_table_partitions(
+    args: CurrentTablePartitionsArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<()> {
+    let table = QualifiedTableIdent::parse(&args.table)?;
+    let config = rest_catalog_config(catalog_args, &table)?;
+
+    let stats = load_current_table_partitions(&config, table.table())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load current table partitions for `{}`",
+                table.display_name()
+            )
+        })?;
+    let document = table_partitions_document(
+        table.display_name(),
+        config.table_endpoint(table.table()),
+        OffsetDateTime::now_utc(),
+        &stats,
     );
 
     print!("{}", render_document(&document, args.output.format)?);
@@ -919,6 +974,10 @@ mod tests {
     use super::{Cell, DocumentFormat, DocumentValue, render_document, render_document_markdown};
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "document shape assertions are intentionally explicit"
+    )]
     fn renders_document_as_markdown() {
         let document = Document {
             title: Cell::new(vec![

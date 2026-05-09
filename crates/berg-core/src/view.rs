@@ -35,9 +35,10 @@ use std::borrow::Borrow;
 use std::collections::HashSet;
 
 use crate::engine::{
-    CurrentDataFileSizeStats, CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
+    CurrentDataFileSizeStats, CurrentTablePartitionStats, CurrentTablePartitions,
+    CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
 };
-use crate::spec::{NestedFieldRef, Schema, Type};
+use crate::spec::{NestedFieldRef, PartitionSpec, Schema, Type};
 use time::OffsetDateTime;
 
 /// Semantic document AST shared by frontends.
@@ -375,6 +376,216 @@ pub fn data_file_size_stats_document(
     }
 }
 
+/// Build a semantic document view from the current partition spec and partition statistics.
+#[must_use]
+pub fn table_partitions_document(
+    table_ident: impl Into<String>,
+    source_endpoint: impl Into<String>,
+    retrieved_at: OffsetDateTime,
+    stats: &CurrentTablePartitions,
+) -> Document {
+    let table_ident = table_ident.into();
+
+    Document {
+        title: Cell::new(vec![
+            DocumentValue::Text("Table Partitions: ".to_string()),
+            DocumentValue::Code(table_ident),
+        ]),
+        blocks: vec![
+            Block::Properties(table_partitions_header_properties(
+                source_endpoint.into(),
+                retrieved_at,
+                stats,
+            )),
+            Block::Section(Section {
+                title: Cell::text("Current Partition Spec"),
+                blocks: vec![
+                    Block::Properties(current_partition_spec_properties(stats)),
+                    Block::Table(partition_spec_table(
+                        &stats.current_schema,
+                        &stats.partition_spec,
+                    )),
+                ],
+            }),
+            Block::Section(Section {
+                title: Cell::text("Partitions"),
+                blocks: vec![
+                    Block::Properties(partition_summary_properties(stats)),
+                    Block::Paragraph(Cell::text(
+                        "Bucket columns contain data file counts, not bytes or percentages.",
+                    )),
+                    Block::Table(partition_stats_table(stats)),
+                ],
+            }),
+        ],
+    }
+}
+
+fn table_partitions_header_properties(
+    source_endpoint: String,
+    retrieved_at: OffsetDateTime,
+    stats: &CurrentTablePartitions,
+) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Source endpoint".to_string(),
+            value: Cell::value(DocumentValue::Uri(source_endpoint)),
+        },
+        Property {
+            label: "Retrieved at".to_string(),
+            value: utc_and_local_timestamp_cell(retrieved_at),
+        },
+        Property {
+            label: "Snapshot ID".to_string(),
+            value: Cell::value(DocumentValue::Number(stats.snapshot_id)),
+        },
+        Property {
+            label: "Updated at".to_string(),
+            value: utc_and_local_timestamp_cell(stats.snapshot_updated_at),
+        },
+        Property {
+            label: "Metadata".to_string(),
+            value: Cell::value(DocumentValue::Uri(stats.metadata_json_path.clone())),
+        },
+        Property {
+            label: "Manifest list".to_string(),
+            value: Cell::value(DocumentValue::Uri(stats.manifest_list_path.clone())),
+        },
+    ]
+}
+
+fn current_partition_spec_properties(stats: &CurrentTablePartitions) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Default spec ID".to_string(),
+            value: Cell::value(DocumentValue::Number(i64::from(
+                stats.partition_spec.spec_id(),
+            ))),
+        },
+        Property {
+            label: "Partitioned".to_string(),
+            value: Cell::value(DocumentValue::Bool(
+                !stats.partition_spec.is_unpartitioned(),
+            )),
+        },
+        Property {
+            label: "Fields".to_string(),
+            value: Cell::value(DocumentValue::Count(stats.partition_spec.fields().len())),
+        },
+    ]
+}
+
+fn partition_summary_properties(stats: &CurrentTablePartitions) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Partitions".to_string(),
+            value: Cell::value(DocumentValue::Count(stats.partitions.len())),
+        },
+        Property {
+            label: "Data files".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(stats.data_file_count)),
+        },
+        Property {
+            label: "Total data file size".to_string(),
+            value: Cell::value(DocumentValue::Bytes(stats.total_data_file_size_bytes)),
+        },
+        Property {
+            label: "Target file size".to_string(),
+            value: Cell::value(DocumentValue::Bytes(stats.target_file_size_bytes)),
+        },
+    ]
+}
+
+fn partition_spec_table(schema: &Schema, partition_spec: &PartitionSpec) -> Table {
+    Table {
+        columns: vec![
+            Cell::text("Name"),
+            Cell::text("Source field"),
+            Cell::text("Source type"),
+            Cell::text("Transform"),
+            Cell::text("Source ID"),
+            Cell::text("Field ID"),
+        ],
+        rows: partition_spec
+            .fields()
+            .iter()
+            .map(|field| Row {
+                cells: vec![
+                    Cell::code(field.name.clone()),
+                    Cell::code(source_field_name(schema, field.source_id)),
+                    Cell::code(source_field_type(schema, field.source_id)),
+                    Cell::code(field.transform.to_string()),
+                    Cell::value(DocumentValue::Number(i64::from(field.source_id))),
+                    Cell::value(DocumentValue::Number(i64::from(field.field_id))),
+                ],
+            })
+            .collect(),
+    }
+}
+
+fn source_field_name(schema: &Schema, source_id: i32) -> String {
+    schema
+        .name_by_field_id(source_id)
+        .map_or_else(|| format!("<unknown:{source_id}>"), ToString::to_string)
+}
+
+fn source_field_type(schema: &Schema, source_id: i32) -> String {
+    schema.field_by_id(source_id).map_or_else(
+        || "unknown".to_string(),
+        |field| type_summary(&field.field_type),
+    )
+}
+
+fn partition_stats_table(stats: &CurrentTablePartitions) -> Table {
+    let mut columns = vec![
+        Cell::text("Spec ID"),
+        Cell::text("Partition"),
+        Cell::text("Files"),
+        Cell::text("Size"),
+    ];
+    columns.extend(
+        stats
+            .bucket_labels
+            .iter()
+            .map(|label| Cell::text(partition_bucket_file_count_column(label))),
+    );
+
+    Table {
+        columns,
+        rows: stats
+            .partitions
+            .iter()
+            .map(|partition| partition_stats_row(partition, stats.bucket_labels.len()))
+            .collect(),
+    }
+}
+
+fn partition_stats_row(partition: &CurrentTablePartitionStats, bucket_count: usize) -> Row {
+    let mut cells = vec![
+        Cell::value(DocumentValue::Number(i64::from(
+            partition.partition_spec_id,
+        ))),
+        Cell::code(partition.partition.clone()),
+        Cell::value(DocumentValue::Unsigned(partition.file_count)),
+        Cell::value(DocumentValue::Bytes(partition.total_size_bytes)),
+    ];
+
+    cells.extend(
+        partition
+            .buckets
+            .iter()
+            .take(bucket_count)
+            .map(|bucket| Cell::value(DocumentValue::Unsigned(bucket.file_count))),
+    );
+    cells.resize_with(4 + bucket_count, || Cell::value(DocumentValue::Unsigned(0)));
+
+    Row { cells }
+}
+
+fn partition_bucket_file_count_column(label: &str) -> String {
+    format!("Files: {label}")
+}
+
 fn data_file_size_stats_header_properties(
     source_endpoint: String,
     retrieved_at: OffsetDateTime,
@@ -406,6 +617,10 @@ fn data_file_size_stats_header_properties(
 
 fn data_file_size_properties(stats: &CurrentDataFileSizeStats) -> Vec<Property> {
     vec![
+        Property {
+            label: "Total data file size".to_string(),
+            value: Cell::value(DocumentValue::Bytes(stats.total_data_file_size_bytes)),
+        },
         Property {
             label: "Data files".to_string(),
             value: Cell::value(DocumentValue::Unsigned(stats.data_file_count)),
@@ -735,18 +950,21 @@ fn type_summary(field_type: &Type) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::engine::{
-        CurrentDataFileSizeStats, CurrentTableStats, DataFileSizeBucketStats,
-        DataFileSizeDistribution,
+        CurrentDataFileSizeStats, CurrentTablePartitionStats, CurrentTablePartitions,
+        CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
     };
     use crate::spec::{
-        ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type,
+        ListType, MapType, NestedField, NestedFieldRef, PartitionSpec, PrimitiveType, Schema,
+        StructType, Transform, Type,
     };
     use time::OffsetDateTime;
 
     use super::{
         Block, Cell, DocumentValue, data_file_size_stats_document, schema_document,
-        table_stats_document,
+        table_partitions_document, table_stats_document,
     };
 
     fn nested_schema() -> Schema {
@@ -1035,6 +1253,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "document shape assertions are intentionally explicit"
+    )]
     fn builds_data_file_size_stats_document() {
         let stats = CurrentDataFileSizeStats {
             snapshot_id: 42,
@@ -1042,6 +1264,7 @@ mod tests {
                 .expect("valid timestamp"),
             manifest_list_path: "s3://warehouse/table/metadata/snap-42.avro".to_string(),
             target_file_size_bytes: 512,
+            total_data_file_size_bytes: 1_200,
             data_file_count: 5,
             avg_data_file_size_bytes: Some(300),
             distribution: Some(DataFileSizeDistribution {
@@ -1088,20 +1311,25 @@ mod tests {
         let Block::Properties(size_properties) = &data_file_sizes.blocks[0] else {
             panic!("data file sizes section should contain properties");
         };
-        assert_eq!("Data files", size_properties[0].label);
+        assert_eq!("Total data file size", size_properties[0].label);
         assert_eq!(
-            Cell::value(DocumentValue::Unsigned(5)),
+            Cell::value(DocumentValue::Bytes(1_200)),
             size_properties[0].value
         );
-        assert_eq!("Target file size", size_properties[1].label);
+        assert_eq!("Data files", size_properties[1].label);
         assert_eq!(
-            Cell::value(DocumentValue::Bytes(512)),
+            Cell::value(DocumentValue::Unsigned(5)),
             size_properties[1].value
         );
-        assert_eq!("Average data file size", size_properties[2].label);
+        assert_eq!("Target file size", size_properties[2].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Bytes(512)),
+            size_properties[2].value
+        );
+        assert_eq!("Average data file size", size_properties[3].label);
         assert_eq!(
             Cell::value(DocumentValue::Bytes(300)),
-            size_properties[2].value
+            size_properties[3].value
         );
 
         let Block::Section(distribution) = &data_file_sizes.blocks[1] else {
@@ -1145,6 +1373,156 @@ mod tests {
                 Cell::value(DocumentValue::PercentageMillis(50_000)),
             ],
             bucket_table.rows[0].cells
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "document shape assertions are intentionally explicit"
+    )]
+    fn builds_table_partitions_document() {
+        let schema = Arc::new(nested_schema());
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(7)
+                .add_partition_field("org_id", "org_id", Transform::Identity)
+                .expect("valid partition field")
+                .build()
+                .expect("valid partition spec"),
+        );
+        let stats = CurrentTablePartitions {
+            snapshot_id: 42,
+            snapshot_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
+                .expect("valid timestamp"),
+            metadata_json_path: "s3://warehouse/table/metadata/00042.metadata.json".to_string(),
+            manifest_list_path: "s3://warehouse/table/metadata/snap-42.avro".to_string(),
+            current_schema: schema,
+            partition_spec,
+            target_file_size_bytes: 512,
+            total_data_file_size_bytes: 900,
+            data_file_count: 3,
+            bucket_labels: vec!["< 16 MiB".to_string(), "75-125% target".to_string()],
+            partitions: vec![CurrentTablePartitionStats {
+                partition_spec_id: 7,
+                partition: "org_id=123".to_string(),
+                file_count: 3,
+                total_size_bytes: 900,
+                buckets: vec![
+                    DataFileSizeBucketStats {
+                        label: "< 16 MiB".to_string(),
+                        file_count: 1,
+                        total_size_bytes: 100,
+                        file_percentage_millis: 33_333,
+                        size_percentage_millis: 11_111,
+                    },
+                    DataFileSizeBucketStats {
+                        label: "75-125% target".to_string(),
+                        file_count: 2,
+                        total_size_bytes: 800,
+                        file_percentage_millis: 66_667,
+                        size_percentage_millis: 88_889,
+                    },
+                ],
+            }],
+        };
+
+        let document = table_partitions_document(
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
+            &stats,
+        );
+
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Text("Table Partitions: ".to_string()),
+                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+            ]),
+            document.title
+        );
+
+        let Block::Properties(properties) = &document.blocks[0] else {
+            panic!("first block should be properties");
+        };
+        assert_eq!("Snapshot ID", properties[2].label);
+        assert_eq!("Metadata", properties[4].label);
+        assert_eq!("Manifest list", properties[5].label);
+
+        let Block::Section(spec_section) = &document.blocks[1] else {
+            panic!("second block should be current partition spec section");
+        };
+        let Block::Properties(spec_properties) = &spec_section.blocks[0] else {
+            panic!("partition spec section should contain properties");
+        };
+        assert_eq!("Default spec ID", spec_properties[0].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Number(7)),
+            spec_properties[0].value
+        );
+
+        let Block::Table(spec_table) = &spec_section.blocks[1] else {
+            panic!("partition spec section should contain a table");
+        };
+        assert_eq!(
+            vec![
+                Cell::text("Name"),
+                Cell::text("Source field"),
+                Cell::text("Source type"),
+                Cell::text("Transform"),
+                Cell::text("Source ID"),
+                Cell::text("Field ID")
+            ],
+            spec_table.columns
+        );
+        assert_eq!(
+            vec![
+                Cell::code("org_id"),
+                Cell::code("org_id"),
+                Cell::code("long"),
+                Cell::code("identity"),
+                Cell::value(DocumentValue::Number(1)),
+                Cell::value(DocumentValue::Number(1000)),
+            ],
+            spec_table.rows[0].cells
+        );
+
+        let Block::Section(partitions_section) = &document.blocks[2] else {
+            panic!("third block should be partitions section");
+        };
+        let Block::Properties(partition_properties) = &partitions_section.blocks[0] else {
+            panic!("partitions section should contain properties");
+        };
+        assert_eq!("Partitions", partition_properties[0].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Count(1)),
+            partition_properties[0].value
+        );
+
+        let Block::Table(partitions_table) = &partitions_section.blocks[2] else {
+            panic!("partitions section should contain a table");
+        };
+        assert_eq!(
+            vec![
+                Cell::text("Spec ID"),
+                Cell::text("Partition"),
+                Cell::text("Files"),
+                Cell::text("Size"),
+                Cell::text("Files: < 16 MiB"),
+                Cell::text("Files: 75-125% target"),
+            ],
+            partitions_table.columns
+        );
+        assert_eq!(
+            vec![
+                Cell::value(DocumentValue::Number(7)),
+                Cell::code("org_id=123"),
+                Cell::value(DocumentValue::Unsigned(3)),
+                Cell::value(DocumentValue::Bytes(900)),
+                Cell::value(DocumentValue::Unsigned(1)),
+                Cell::value(DocumentValue::Unsigned(2)),
+            ],
+            partitions_table.rows[0].cells
         );
     }
 }

@@ -11,7 +11,7 @@ use berg_core::view::{
     Block, Cell, Document, DocumentValue, List, ListKind, data_file_size_stats_document,
     schema_document, table_partitions_document, table_stats_document,
 };
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
@@ -116,6 +116,17 @@ enum Commands {
     Schema(SchemaArgs),
     /// Inspect Iceberg tables.
     Table(TableArgs),
+    /// Print the full command tree.
+    #[command(name = "commands")]
+    CommandTree(CommandTreeArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(disable_help_flag = true)]
+struct CommandTreeArgs {
+    /// Print the full command tree.
+    #[arg(short = 'h', long = "help")]
+    _help: bool,
 }
 
 #[derive(Debug, Args)]
@@ -280,10 +291,57 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         },
+        Some(Commands::CommandTree(_)) => print_command_tree(),
         None => println!("{}", berg_core::welcome_message("berg")?),
     }
 
     Ok(())
+}
+
+fn print_command_tree() {
+    print!("{}", command_tree());
+}
+
+fn command_tree() -> String {
+    let command = Cli::command();
+    let mut output = String::new();
+
+    writeln!(
+        output,
+        "{} - {}",
+        command.get_name(),
+        command_description(&command)
+    )
+    .expect("write to string");
+    render_subcommand_tree(&command, "", &mut output);
+
+    output
+}
+
+fn render_subcommand_tree(command: &clap::Command, prefix: &str, output: &mut String) {
+    let subcommands = command.get_subcommands().collect::<Vec<_>>();
+
+    for (index, subcommand) in subcommands.iter().enumerate() {
+        let is_last = index == subcommands.len() - 1;
+        let branch = if is_last { "└── " } else { "├── " };
+
+        writeln!(
+            output,
+            "{prefix}{branch}{} - {}",
+            subcommand.get_name(),
+            command_description(subcommand)
+        )
+        .expect("write to string");
+
+        let next_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
+        render_subcommand_tree(subcommand, &next_prefix, output);
+    }
+}
+
+fn command_description(command: &clap::Command) -> String {
+    command
+        .get_about()
+        .map_or_else(String::new, ToString::to_string)
 }
 
 async fn print_current_schema(
@@ -971,7 +1029,10 @@ mod tests {
         Block, Document, List, ListItem, ListKind, Property, Row, Section, Table,
     };
 
-    use super::{Cell, DocumentFormat, DocumentValue, render_document, render_document_markdown};
+    use super::{
+        Cell, DocumentFormat, DocumentValue, command_tree, render_document,
+        render_document_markdown,
+    };
 
     #[test]
     #[expect(
@@ -1107,5 +1168,21 @@ mod tests {
         let err = render_document(&document, DocumentFormat::Json).expect_err("JSON is deferred");
 
         assert!(err.to_string().contains("not implemented"));
+    }
+
+    #[test]
+    fn renders_full_command_tree() {
+        let tree = command_tree();
+
+        assert!(tree.contains("berg - Command-line interface for Berg."));
+        assert!(tree.contains("├── schema - Inspect Iceberg table schemas"));
+        assert!(tree.contains("│   └── current - Show the current schema"));
+        assert!(tree.contains("├── table - Inspect Iceberg tables"));
+        assert!(tree.contains("│   ├── files - Inspect Iceberg table files"));
+        assert!(tree.contains("│   │   └── data - Inspect Iceberg data files"));
+        assert!(tree.contains("│   │       └── stats - Show data file size statistics"));
+        assert!(tree.contains("│   ├── partitions - Inspect Iceberg table partitions"));
+        assert!(tree.contains("│   └── stats - Inspect Iceberg table statistics"));
+        assert!(tree.contains("└── commands - Print the full command tree"));
     }
 }

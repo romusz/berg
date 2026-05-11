@@ -34,6 +34,14 @@ Run the TUI:
 cargo run -p berg-tui
 ```
 
+Build release binaries and copy them to `~/bin`:
+
+```sh
+mise run install
+```
+
+By default this installs both `berg` and `berg-tui`.
+
 ## License
 
 Licensed under either of

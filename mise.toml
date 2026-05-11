@@ -1,0 +1,12 @@
+[tasks.release]
+description = "Build release binaries"
+run = "cargo build --workspace --release --locked"
+
+[tasks.install]
+description = "Build release binaries and copy them to ~/bin"
+depends = ["release"]
+run = '''
+mkdir -p "$HOME/bin"
+cp target/release/berg "$HOME/bin/berg"
+cp target/release/berg-tui "$HOME/bin/berg-tui"
+'''

@@ -176,6 +176,89 @@ pub struct CurrentDataFileSizeStats {
     pub buckets: Vec<DataFileSizeBucketStats>,
 }
 
+/// Manifest files in the current Iceberg table snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentManifestFileList {
+    /// Snapshot this list was read from.
+    pub snapshot_id: i64,
+    /// Snapshot commit/update timestamp.
+    pub snapshot_updated_at: OffsetDateTime,
+    /// Current snapshot manifest list location.
+    pub manifest_list_path: String,
+    /// Manifest files in current snapshot manifest list order.
+    pub files: Vec<ManifestFileListEntry>,
+}
+
+/// One entry from the current snapshot manifest list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestFileListEntry {
+    /// Short generated ID for selecting this manifest file.
+    pub id: String,
+    /// Manifest file basename.
+    pub name: String,
+    /// Full manifest file path.
+    pub path: String,
+    /// Manifest content type.
+    pub content: ManifestContentType,
+    /// Manifest file length in bytes.
+    pub size_bytes: u64,
+    /// Partition spec ID used to write files in this manifest.
+    pub partition_spec_id: i32,
+    /// Number of added files when reported.
+    pub added_files_count: Option<u32>,
+    /// Number of existing files when reported.
+    pub existing_files_count: Option<u32>,
+    /// Number of deleted files when reported.
+    pub deleted_files_count: Option<u32>,
+}
+
+/// One selected manifest file from the current Iceberg table snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentManifestFileDetail {
+    /// Snapshot this detail was read from.
+    pub snapshot_id: i64,
+    /// Snapshot commit/update timestamp.
+    pub snapshot_updated_at: OffsetDateTime,
+    /// Current snapshot manifest list location.
+    pub manifest_list_path: String,
+    /// Number of manifest files in the current snapshot manifest list.
+    pub manifest_file_count: u64,
+    /// Short generated ID used to select this manifest file.
+    pub manifest_file_id: String,
+    /// Selected manifest file.
+    pub manifest_file: spec::ManifestFile,
+    /// Metadata fields available for each partition field summary in the selected manifest file.
+    pub partition_metadata: Vec<ManifestPartitionMetadataSummary>,
+    /// Column metric fields available across live entries in the selected manifest file.
+    pub column_metadata: Vec<ManifestColumnMetadataSummary>,
+}
+
+/// Metadata entries available for one manifest partition field summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestPartitionMetadataSummary {
+    /// Partition field name from the manifest file's partition spec, or a synthetic placeholder.
+    pub field_name: String,
+    /// Partition field ID from the manifest file's partition spec when known.
+    pub field_id: Option<i32>,
+    /// Whether the optional `contains_nan` metadata field is present.
+    pub has_contains_nan: bool,
+    /// Whether a lower bound exists. The bound value itself is intentionally not exposed here.
+    pub has_lower_bound: bool,
+    /// Whether an upper bound exists. The bound value itself is intentionally not exposed here.
+    pub has_upper_bound: bool,
+}
+
+/// Metadata entries available for one table column in a selected manifest file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestColumnMetadataSummary {
+    /// Column name from the table schema, or a synthetic placeholder.
+    pub column_name: String,
+    /// Iceberg field ID for the column.
+    pub field_id: i32,
+    /// Column metadata field names present for this column. Bound values themselves are intentionally not exposed here.
+    pub metadata_fields: Vec<String>,
+}
+
 /// Current snapshot partition layout and per-partition data file statistics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentTablePartitions {
@@ -485,6 +568,89 @@ pub async fn load_current_data_file_size_stats(
     })
 }
 
+/// Load current snapshot manifest files for a table through an Iceberg REST catalog.
+///
+/// # Errors
+///
+/// Returns an Iceberg-backed error when catalog, metadata, or manifest list reads
+/// fail. Returns [`BergError::NoCurrentSnapshot`] when the table has no current
+/// snapshot.
+pub async fn load_current_manifest_file_list(
+    config: &RestCatalogConfig,
+    table_ident: &TableIdent,
+) -> Result<CurrentManifestFileList> {
+    let table = load_table(config, table_ident).await?;
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .current_snapshot()
+        .ok_or_else(|| BergError::NoCurrentSnapshot {
+            table: table_ident.to_string(),
+        })?;
+    let manifest_list_path = snapshot.manifest_list().to_string();
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await?;
+    let snapshot_updated_at = snapshot_updated_at(snapshot.snapshot_id(), snapshot.timestamp_ms())?;
+
+    Ok(CurrentManifestFileList {
+        snapshot_id: snapshot.snapshot_id(),
+        snapshot_updated_at,
+        manifest_list_path,
+        files: manifest_file_list_entries(manifest_list.entries())?,
+    })
+}
+
+/// Load one current snapshot manifest file for a table through an Iceberg REST catalog.
+///
+/// # Errors
+///
+/// Returns an Iceberg-backed error when catalog, metadata, manifest list, or
+/// manifest reads fail. Returns [`BergError::NoCurrentSnapshot`] when the table
+/// has no current snapshot. Returns [`BergError::UnknownManifestFileId`] when
+/// `manifest_file_id` is not in the current manifest list.
+pub async fn load_current_manifest_file_detail(
+    config: &RestCatalogConfig,
+    table_ident: &TableIdent,
+    manifest_file_id: &str,
+) -> Result<CurrentManifestFileDetail> {
+    let table = load_table(config, table_ident).await?;
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .current_snapshot()
+        .ok_or_else(|| BergError::NoCurrentSnapshot {
+            table: table_ident.to_string(),
+        })?;
+    let manifest_list_path = snapshot.manifest_list().to_string();
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), &table.metadata_ref())
+        .await?;
+    let snapshot_updated_at = snapshot_updated_at(snapshot.snapshot_id(), snapshot.timestamp_ms())?;
+    let (manifest_file_id, manifest_file) =
+        find_manifest_file_by_id(manifest_list.entries(), manifest_file_id)
+            .map(|(id, manifest_file)| (id, manifest_file.clone()))
+            .ok_or_else(|| BergError::UnknownManifestFileId {
+                id: manifest_file_id.to_string(),
+                available: manifest_file_ids(manifest_list.entries()),
+            })?;
+    let partition_spec = metadata
+        .partition_spec_by_id(manifest_file.partition_spec_id)
+        .map(std::convert::AsRef::as_ref);
+    let partition_metadata = manifest_partition_metadata(&manifest_file, partition_spec);
+    let manifest = manifest_file.load_manifest(table.file_io()).await?;
+    let column_metadata = manifest_column_metadata(&manifest, metadata.current_schema());
+
+    Ok(CurrentManifestFileDetail {
+        snapshot_id: snapshot.snapshot_id(),
+        snapshot_updated_at,
+        manifest_list_path,
+        manifest_file_count: manifest_list.entries().len() as u64,
+        manifest_file_id,
+        manifest_file,
+        partition_metadata,
+        column_metadata,
+    })
+}
+
 /// Load the current partition spec and current snapshot per-partition file statistics.
 ///
 /// # Errors
@@ -600,6 +766,258 @@ where
 
 fn manifest_file_has_live_files(manifest_file: &spec::ManifestFile) -> bool {
     manifest_file.has_added_files() || manifest_file.has_existing_files()
+}
+
+fn manifest_file_list_entries(
+    manifest_files: &[spec::ManifestFile],
+) -> Result<Vec<ManifestFileListEntry>> {
+    manifest_files
+        .iter()
+        .enumerate()
+        .map(|(index, manifest_file)| manifest_file_list_entry(index, manifest_file))
+        .collect()
+}
+
+fn manifest_file_list_entry(
+    index: usize,
+    manifest_file: &spec::ManifestFile,
+) -> Result<ManifestFileListEntry> {
+    let size_bytes = u64::try_from(manifest_file.manifest_length).map_err(|_| {
+        BergError::InvalidManifestLength {
+            path: manifest_file.manifest_path.clone(),
+            length: manifest_file.manifest_length,
+        }
+    })?;
+
+    Ok(ManifestFileListEntry {
+        id: manifest_file_id(index),
+        name: manifest_file_name(&manifest_file.manifest_path),
+        path: manifest_file.manifest_path.clone(),
+        content: manifest_file.content,
+        size_bytes,
+        partition_spec_id: manifest_file.partition_spec_id,
+        added_files_count: manifest_file.added_files_count,
+        existing_files_count: manifest_file.existing_files_count,
+        deleted_files_count: manifest_file.deleted_files_count,
+    })
+}
+
+fn find_manifest_file_by_id<'a>(
+    manifest_files: &'a [spec::ManifestFile],
+    requested_id: &str,
+) -> Option<(String, &'a spec::ManifestFile)> {
+    manifest_files
+        .iter()
+        .enumerate()
+        .find_map(|(index, manifest_file)| {
+            manifest_file_matches_id(index, manifest_file, requested_id)
+                .then(|| (manifest_file_id(index), manifest_file))
+        })
+}
+
+fn manifest_file_matches_id(
+    index: usize,
+    manifest_file: &spec::ManifestFile,
+    requested_id: &str,
+) -> bool {
+    let id = manifest_file_id(index);
+    let name = manifest_file_name(&manifest_file.manifest_path);
+    let stem = manifest_file_stem(&name);
+
+    requested_id == id || requested_id == name || requested_id == stem
+}
+
+fn manifest_file_ids(manifest_files: &[spec::ManifestFile]) -> Vec<String> {
+    manifest_files
+        .iter()
+        .enumerate()
+        .map(|(index, _)| manifest_file_id(index))
+        .collect()
+}
+
+fn manifest_file_id(index: usize) -> String {
+    format!("m{}", index + 1)
+}
+
+fn manifest_file_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+fn manifest_file_stem(name: &str) -> &str {
+    name.strip_suffix(".avro").unwrap_or(name)
+}
+
+fn manifest_partition_metadata(
+    manifest_file: &spec::ManifestFile,
+    partition_spec: Option<&spec::PartitionSpec>,
+) -> Vec<ManifestPartitionMetadataSummary> {
+    manifest_file
+        .partitions
+        .as_ref()
+        .map_or_else(Vec::new, |fields| {
+            fields
+                .iter()
+                .enumerate()
+                .map(|(index, field_summary)| {
+                    let partition_field = partition_spec.and_then(|spec| spec.fields().get(index));
+
+                    ManifestPartitionMetadataSummary {
+                        field_name: partition_field
+                            .map_or_else(|| format!("<field:{index}>"), |field| field.name.clone()),
+                        field_id: partition_field.map(|field| field.field_id),
+                        has_contains_nan: field_summary.contains_nan.is_some(),
+                        has_lower_bound: field_summary.lower_bound.is_some(),
+                        has_upper_bound: field_summary.upper_bound.is_some(),
+                    }
+                })
+                .collect()
+        })
+}
+
+fn manifest_column_metadata(
+    manifest: &spec::Manifest,
+    schema: &spec::Schema,
+) -> Vec<ManifestColumnMetadataSummary> {
+    let mut accumulators = BTreeMap::<i32, ColumnMetadataAccumulator>::new();
+    let column_paths = schema_field_paths(schema);
+
+    for entry in live_manifest_entries(manifest) {
+        let data_file = entry.data_file();
+        add_column_metadata_keys(
+            &mut accumulators,
+            data_file.column_sizes().keys(),
+            COLUMN_METADATA_COLUMN_SIZES,
+        );
+        add_column_metadata_keys(
+            &mut accumulators,
+            data_file.value_counts().keys(),
+            COLUMN_METADATA_VALUE_COUNTS,
+        );
+        add_column_metadata_keys(
+            &mut accumulators,
+            data_file.null_value_counts().keys(),
+            COLUMN_METADATA_NULL_VALUE_COUNTS,
+        );
+        add_column_metadata_keys(
+            &mut accumulators,
+            data_file.nan_value_counts().keys(),
+            COLUMN_METADATA_NAN_VALUE_COUNTS,
+        );
+        add_column_metadata_keys(
+            &mut accumulators,
+            data_file.lower_bounds().keys(),
+            COLUMN_METADATA_LOWER_BOUNDS,
+        );
+        add_column_metadata_keys(
+            &mut accumulators,
+            data_file.upper_bounds().keys(),
+            COLUMN_METADATA_UPPER_BOUNDS,
+        );
+    }
+
+    accumulators
+        .into_iter()
+        .map(|(field_id, accumulator)| accumulator.into_summary(field_id, &column_paths))
+        .collect()
+}
+
+fn schema_field_paths(schema: &spec::Schema) -> BTreeMap<i32, String> {
+    let mut paths = BTreeMap::new();
+
+    for field in schema.as_struct().fields() {
+        collect_schema_field_paths(&mut paths, field, &field.name);
+    }
+
+    paths
+}
+
+fn collect_schema_field_paths(
+    paths: &mut BTreeMap<i32, String>,
+    field: &spec::NestedFieldRef,
+    path: &str,
+) {
+    paths.insert(field.id, path.to_string());
+
+    match field.field_type.as_ref() {
+        spec::Type::Struct(struct_type) => {
+            for child in struct_type.fields() {
+                collect_schema_field_paths(paths, child, &format!("{path}.{}", child.name));
+            }
+        }
+        spec::Type::List(list_type) => {
+            collect_schema_field_paths(paths, &list_type.element_field, &format!("{path}[]"));
+        }
+        spec::Type::Map(map_type) => {
+            collect_schema_field_paths(paths, &map_type.key_field, &format!("{path}{{}}.key"));
+            collect_schema_field_paths(
+                paths,
+                &map_type.value_field,
+                &map_value_schema_path(path, map_type.value_field.field_type.as_ref()),
+            );
+        }
+        spec::Type::Primitive(_) => {}
+    }
+}
+
+fn map_value_schema_path(path: &str, value_type: &spec::Type) -> String {
+    match value_type {
+        spec::Type::Struct(_) | spec::Type::List(_) | spec::Type::Map(_) => format!("{path}{{}}"),
+        spec::Type::Primitive(_) => format!("{path}{{}}.value"),
+    }
+}
+
+fn add_column_metadata_keys<'a, I>(
+    accumulators: &mut BTreeMap<i32, ColumnMetadataAccumulator>,
+    field_ids: I,
+    field: u8,
+) where
+    I: IntoIterator<Item = &'a i32>,
+{
+    for field_id in field_ids {
+        accumulators.entry(*field_id).or_default().fields |= field;
+    }
+}
+
+const COLUMN_METADATA_COLUMN_SIZES: u8 = 1 << 0;
+const COLUMN_METADATA_VALUE_COUNTS: u8 = 1 << 1;
+const COLUMN_METADATA_NULL_VALUE_COUNTS: u8 = 1 << 2;
+const COLUMN_METADATA_NAN_VALUE_COUNTS: u8 = 1 << 3;
+const COLUMN_METADATA_LOWER_BOUNDS: u8 = 1 << 4;
+const COLUMN_METADATA_UPPER_BOUNDS: u8 = 1 << 5;
+
+#[derive(Debug, Default)]
+struct ColumnMetadataAccumulator {
+    fields: u8,
+}
+
+impl ColumnMetadataAccumulator {
+    fn into_summary(
+        self,
+        field_id: i32,
+        column_paths: &BTreeMap<i32, String>,
+    ) -> ManifestColumnMetadataSummary {
+        ManifestColumnMetadataSummary {
+            column_name: column_paths
+                .get(&field_id)
+                .map_or_else(|| format!("<field:{field_id}>"), ToString::to_string),
+            field_id,
+            metadata_fields: column_metadata_field_names(self.fields),
+        }
+    }
+}
+
+fn column_metadata_field_names(fields: u8) -> Vec<String> {
+    [
+        (COLUMN_METADATA_COLUMN_SIZES, "column_sizes"),
+        (COLUMN_METADATA_VALUE_COUNTS, "value_counts"),
+        (COLUMN_METADATA_NULL_VALUE_COUNTS, "null_value_counts"),
+        (COLUMN_METADATA_NAN_VALUE_COUNTS, "nan_value_counts"),
+        (COLUMN_METADATA_LOWER_BOUNDS, "lower_bounds"),
+        (COLUMN_METADATA_UPPER_BOUNDS, "upper_bounds"),
+    ]
+    .into_iter()
+    .filter_map(|(field, name)| ((fields & field) != 0).then_some(name.to_string()))
+    .collect()
 }
 
 fn live_manifest_entries(
@@ -1041,14 +1459,18 @@ mod tests {
     use std::sync::Arc;
 
     use crate::spec::{
-        Literal, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType, Schema, Struct,
-        Transform, Type,
+        FieldSummary, Literal, ManifestContentType, ManifestFile, NestedField, PartitionSpec,
+        PrimitiveLiteral, PrimitiveType, Schema, Struct, Transform, Type,
     };
 
     use super::{
+        COLUMN_METADATA_COLUMN_SIZES, COLUMN_METADATA_LOWER_BOUNDS,
+        COLUMN_METADATA_NULL_VALUE_COUNTS, COLUMN_METADATA_VALUE_COUNTS, ColumnMetadataAccumulator,
         DataFileSizeDistribution, PartitionAccumulator, QualifiedTableIdent, RestCatalogConfig,
         credential_from_env_output, data_file_size_buckets, data_file_size_distribution,
+        find_manifest_file_by_id, manifest_file_list_entries, manifest_partition_metadata,
         parse_catalog_property, partition_path, partition_stats_from_accumulators, rounded_average,
+        schema_field_paths,
     };
 
     #[test]
@@ -1175,6 +1597,113 @@ AWS_SESSION_TOKEN='token'
     }
 
     #[test]
+    fn builds_manifest_file_list_entries() {
+        let manifest_files = [manifest_file(
+            "s3://bucket/path/manifest.avro",
+            Some(3),
+            Some(2),
+        )];
+
+        let entries = manifest_file_list_entries(&manifest_files).expect("manifest entries");
+
+        assert_eq!(1, entries.len());
+        assert_eq!("m1", entries[0].id);
+        assert_eq!("manifest.avro", entries[0].name);
+        assert_eq!("s3://bucket/path/manifest.avro", entries[0].path);
+        assert_eq!(1024, entries[0].size_bytes);
+        assert_eq!(Some(3), entries[0].added_files_count);
+        assert_eq!(Some(2), entries[0].existing_files_count);
+    }
+
+    #[test]
+    fn finds_manifest_file_by_short_id_or_name() {
+        let first_manifest = manifest_file("s3://bucket/first.avro", Some(0), Some(0));
+        let second_manifest = manifest_file("s3://bucket/second.avro", Some(0), Some(0));
+        let manifest_files = [first_manifest, second_manifest];
+
+        let (id, manifest_file) =
+            find_manifest_file_by_id(&manifest_files, "m2").expect("manifest by id");
+        assert_eq!("m2", id);
+        assert_eq!("s3://bucket/second.avro", manifest_file.manifest_path);
+
+        let (id, manifest_file) =
+            find_manifest_file_by_id(&manifest_files, "first").expect("manifest by stem");
+        assert_eq!("m1", id);
+        assert_eq!("s3://bucket/first.avro", manifest_file.manifest_path);
+    }
+
+    #[test]
+    fn summarizes_manifest_partition_metadata_presence() {
+        let schema = Arc::new(partition_test_schema());
+        let partition_spec = PartitionSpec::builder(schema)
+            .with_spec_id(7)
+            .add_partition_field("org_id", "org_id", Transform::Identity)
+            .expect("valid identity partition field")
+            .add_partition_field("day", "day_bucket", Transform::Bucket(16))
+            .expect("valid bucket partition field")
+            .build()
+            .expect("valid partition spec");
+        let mut manifest_file = manifest_file("live.avro", Some(1), Some(0));
+        manifest_file.partition_spec_id = 7;
+        manifest_file.partitions = Some(vec![
+            FieldSummary {
+                contains_null: false,
+                contains_nan: Some(false),
+                lower_bound: Some(vec![1].into()),
+                upper_bound: None,
+            },
+            FieldSummary {
+                contains_null: true,
+                contains_nan: None,
+                lower_bound: None,
+                upper_bound: Some(vec![2].into()),
+            },
+        ]);
+
+        let metadata = manifest_partition_metadata(&manifest_file, Some(&partition_spec));
+
+        assert_eq!(2, metadata.len());
+        assert_eq!("org_id", metadata[0].field_name);
+        assert_eq!(Some(1000), metadata[0].field_id);
+        assert!(metadata[0].has_contains_nan);
+        assert!(metadata[0].has_lower_bound);
+        assert!(!metadata[0].has_upper_bound);
+        assert_eq!("day_bucket", metadata[1].field_name);
+        assert_eq!(Some(1001), metadata[1].field_id);
+        assert!(!metadata[1].has_contains_nan);
+        assert!(!metadata[1].has_lower_bound);
+        assert!(metadata[1].has_upper_bound);
+    }
+
+    #[test]
+    fn summarizes_manifest_column_metadata_presence() {
+        let schema = partition_test_schema();
+        let column_paths = schema_field_paths(&schema);
+
+        let summary = ColumnMetadataAccumulator {
+            fields: COLUMN_METADATA_COLUMN_SIZES
+                | COLUMN_METADATA_VALUE_COUNTS
+                | COLUMN_METADATA_NULL_VALUE_COUNTS
+                | COLUMN_METADATA_LOWER_BOUNDS,
+        }
+        .into_summary(1, &column_paths);
+        let unknown_summary = ColumnMetadataAccumulator::default().into_summary(99, &column_paths);
+
+        assert_eq!("org_id", summary.column_name);
+        assert_eq!(1, summary.field_id);
+        assert_eq!(
+            vec![
+                "column_sizes".to_string(),
+                "value_counts".to_string(),
+                "null_value_counts".to_string(),
+                "lower_bounds".to_string()
+            ],
+            summary.metadata_fields
+        );
+        assert_eq!("<field:99>", unknown_summary.column_name);
+    }
+
+    #[test]
     fn formats_unpartitioned_partition_path() {
         let schema = partition_test_schema();
         let partition_spec = PartitionSpec::unpartition_spec();
@@ -1260,5 +1789,30 @@ AWS_SESSION_TOKEN='token'
             ])
             .build()
             .expect("valid schema")
+    }
+
+    fn manifest_file(
+        manifest_path: &'static str,
+        added_files_count: Option<u32>,
+        existing_files_count: Option<u32>,
+    ) -> ManifestFile {
+        ManifestFile {
+            manifest_path: manifest_path.to_string(),
+            manifest_length: 1024,
+            partition_spec_id: 0,
+            content: ManifestContentType::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 42,
+            added_files_count,
+            existing_files_count,
+            deleted_files_count: Some(0),
+            added_rows_count: Some(0),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        }
     }
 }

@@ -36,6 +36,10 @@ pub enum BergError {
     #[error("manifest `{path}` has invalid length `{length}`")]
     InvalidManifestLength { path: String, length: i64 },
 
+    /// A requested manifest file ID was not present in the current manifest list.
+    #[error("manifest file id `{id}` not found; available ids: {}", available.join(", "))]
+    UnknownManifestFileId { id: String, available: Vec<String> },
+
     /// A snapshot timestamp could not be represented.
     #[error("snapshot `{snapshot_id}` has invalid timestamp `{timestamp_ms}`")]
     InvalidSnapshotTimestamp { snapshot_id: i64, timestamp_ms: i64 },

@@ -35,10 +35,12 @@ use std::borrow::Borrow;
 use std::collections::HashSet;
 
 use crate::engine::{
-    CurrentDataFileSizeStats, CurrentTablePartitionStats, CurrentTablePartitions,
-    CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
+    CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
+    CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableStats, DataFileSizeBucketStats,
+    DataFileSizeDistribution, ManifestColumnMetadataSummary, ManifestFileListEntry,
+    ManifestPartitionMetadataSummary,
 };
-use crate::spec::{NestedFieldRef, PartitionSpec, Schema, Type};
+use crate::spec::{ManifestFile, NestedFieldRef, PartitionSpec, Schema, Type};
 use time::OffsetDateTime;
 
 /// Semantic document AST shared by frontends.
@@ -376,6 +378,74 @@ pub fn data_file_size_stats_document(
     }
 }
 
+/// Build a semantic document view from current snapshot manifest files.
+#[must_use]
+pub fn manifest_file_list_document(
+    table_ident: impl Into<String>,
+    source_endpoint: impl Into<String>,
+    retrieved_at: OffsetDateTime,
+    manifest_files: &CurrentManifestFileList,
+) -> Document {
+    let table_ident = table_ident.into();
+
+    Document {
+        title: Cell::new(vec![
+            DocumentValue::Text("Manifest Files: ".to_string()),
+            DocumentValue::Code(table_ident),
+        ]),
+        blocks: vec![
+            Block::Properties(manifest_file_list_header_properties(
+                source_endpoint.into(),
+                retrieved_at,
+                manifest_files,
+            )),
+            Block::Section(Section {
+                title: Cell::text("Manifest Files"),
+                blocks: manifest_file_list_blocks(&manifest_files.files),
+            }),
+        ],
+    }
+}
+
+/// Build a semantic document view from one selected current snapshot manifest file.
+#[must_use]
+pub fn manifest_file_detail_document(
+    table_ident: impl Into<String>,
+    source_endpoint: impl Into<String>,
+    retrieved_at: OffsetDateTime,
+    detail: &CurrentManifestFileDetail,
+) -> Document {
+    let table_ident = table_ident.into();
+
+    Document {
+        title: Cell::new(vec![
+            DocumentValue::Text("Manifest File: ".to_string()),
+            DocumentValue::Code(table_ident),
+            DocumentValue::Text(" ".to_string()),
+            DocumentValue::Code(detail.manifest_file_id.clone()),
+        ]),
+        blocks: vec![
+            Block::Properties(manifest_file_detail_header_properties(
+                source_endpoint.into(),
+                retrieved_at,
+                detail,
+            )),
+            Block::Section(Section {
+                title: Cell::text("Manifest File"),
+                blocks: manifest_file_detail_blocks(&detail.manifest_file),
+            }),
+            Block::Section(Section {
+                title: Cell::text("Partition Metadata"),
+                blocks: partition_metadata_blocks(&detail.partition_metadata),
+            }),
+            Block::Section(Section {
+                title: Cell::text("Column Metadata"),
+                blocks: column_metadata_blocks(&detail.column_metadata),
+            }),
+        ],
+    }
+}
+
 /// Build a semantic document view from the current partition spec and partition statistics.
 #[must_use]
 pub fn table_partitions_document(
@@ -418,6 +488,269 @@ pub fn table_partitions_document(
                 ],
             }),
         ],
+    }
+}
+
+fn manifest_file_list_header_properties(
+    source_endpoint: String,
+    retrieved_at: OffsetDateTime,
+    manifest_files: &CurrentManifestFileList,
+) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Source endpoint".to_string(),
+            value: Cell::value(DocumentValue::Uri(source_endpoint)),
+        },
+        Property {
+            label: "Retrieved at".to_string(),
+            value: utc_and_local_timestamp_cell(retrieved_at),
+        },
+        Property {
+            label: "Snapshot ID".to_string(),
+            value: Cell::value(DocumentValue::Number(manifest_files.snapshot_id)),
+        },
+        Property {
+            label: "Updated at".to_string(),
+            value: utc_and_local_timestamp_cell(manifest_files.snapshot_updated_at),
+        },
+        Property {
+            label: "Manifest list".to_string(),
+            value: Cell::value(DocumentValue::Uri(
+                manifest_files.manifest_list_path.clone(),
+            )),
+        },
+        Property {
+            label: "Manifest files".to_string(),
+            value: Cell::value(DocumentValue::Count(manifest_files.files.len())),
+        },
+    ]
+}
+
+fn manifest_file_detail_header_properties(
+    source_endpoint: String,
+    retrieved_at: OffsetDateTime,
+    detail: &CurrentManifestFileDetail,
+) -> Vec<Property> {
+    let mut properties = vec![
+        Property {
+            label: "Source endpoint".to_string(),
+            value: Cell::value(DocumentValue::Uri(source_endpoint)),
+        },
+        Property {
+            label: "Retrieved at".to_string(),
+            value: utc_and_local_timestamp_cell(retrieved_at),
+        },
+        Property {
+            label: "Snapshot ID".to_string(),
+            value: Cell::value(DocumentValue::Number(detail.snapshot_id)),
+        },
+        Property {
+            label: "Updated at".to_string(),
+            value: utc_and_local_timestamp_cell(detail.snapshot_updated_at),
+        },
+        Property {
+            label: "Manifest list".to_string(),
+            value: Cell::value(DocumentValue::Uri(detail.manifest_list_path.clone())),
+        },
+        Property {
+            label: "Manifest files".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(detail.manifest_file_count)),
+        },
+    ];
+
+    properties.push(Property {
+        label: "Manifest file ID".to_string(),
+        value: Cell::code(detail.manifest_file_id.clone()),
+    });
+
+    properties
+}
+
+fn manifest_file_list_blocks(files: &[ManifestFileListEntry]) -> Vec<Block> {
+    if files.is_empty() {
+        return vec![Block::Paragraph(Cell::text("No manifest files found."))];
+    }
+
+    vec![Block::Table(Table {
+        columns: vec![
+            Cell::text("ID"),
+            Cell::text("Name"),
+            Cell::text("Content"),
+            Cell::text("Size"),
+            Cell::text("Partition spec ID"),
+            Cell::text("Added files"),
+            Cell::text("Existing files"),
+            Cell::text("Deleted files"),
+        ],
+        rows: files.iter().map(manifest_file_list_row).collect(),
+    })]
+}
+
+fn manifest_file_list_row(file: &ManifestFileListEntry) -> Row {
+    Row {
+        cells: vec![
+            Cell::code(file.id.clone()),
+            Cell::code(file.name.clone()),
+            Cell::code(file.content.to_string()),
+            Cell::value(DocumentValue::Bytes(file.size_bytes)),
+            Cell::value(DocumentValue::Number(i64::from(file.partition_spec_id))),
+            optional_u32_cell(file.added_files_count),
+            optional_u32_cell(file.existing_files_count),
+            optional_u32_cell(file.deleted_files_count),
+        ],
+    }
+}
+
+fn manifest_file_detail_blocks(manifest_file: &ManifestFile) -> Vec<Block> {
+    vec![Block::Properties(manifest_file_properties(manifest_file))]
+}
+
+fn manifest_file_properties(manifest_file: &ManifestFile) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Path".to_string(),
+            value: Cell::value(DocumentValue::Uri(manifest_file.manifest_path.clone())),
+        },
+        Property {
+            label: "Content".to_string(),
+            value: Cell::code(manifest_file.content.to_string()),
+        },
+        Property {
+            label: "Length".to_string(),
+            value: manifest_length_cell(manifest_file.manifest_length),
+        },
+        Property {
+            label: "Partition spec ID".to_string(),
+            value: Cell::value(DocumentValue::Number(i64::from(
+                manifest_file.partition_spec_id,
+            ))),
+        },
+        Property {
+            label: "Sequence number".to_string(),
+            value: Cell::value(DocumentValue::Number(manifest_file.sequence_number)),
+        },
+        Property {
+            label: "Min sequence number".to_string(),
+            value: Cell::value(DocumentValue::Number(manifest_file.min_sequence_number)),
+        },
+        Property {
+            label: "Added snapshot ID".to_string(),
+            value: Cell::value(DocumentValue::Number(manifest_file.added_snapshot_id)),
+        },
+        Property {
+            label: "Added files".to_string(),
+            value: optional_u32_cell(manifest_file.added_files_count),
+        },
+        Property {
+            label: "Existing files".to_string(),
+            value: optional_u32_cell(manifest_file.existing_files_count),
+        },
+        Property {
+            label: "Deleted files".to_string(),
+            value: optional_u32_cell(manifest_file.deleted_files_count),
+        },
+        Property {
+            label: "Added rows".to_string(),
+            value: optional_u64_cell(manifest_file.added_rows_count),
+        },
+        Property {
+            label: "Existing rows".to_string(),
+            value: optional_u64_cell(manifest_file.existing_rows_count),
+        },
+        Property {
+            label: "Deleted rows".to_string(),
+            value: optional_u64_cell(manifest_file.deleted_rows_count),
+        },
+        Property {
+            label: "Partition summaries".to_string(),
+            value: optional_usize_cell(manifest_file.partitions.as_ref().map(Vec::len)),
+        },
+        Property {
+            label: "Key metadata".to_string(),
+            value: optional_usize_cell(manifest_file.key_metadata.as_ref().map(Vec::len)),
+        },
+        Property {
+            label: "First row ID".to_string(),
+            value: optional_u64_cell(manifest_file.first_row_id),
+        },
+    ]
+}
+
+fn partition_metadata_blocks(metadata: &[ManifestPartitionMetadataSummary]) -> Vec<Block> {
+    if metadata.is_empty() {
+        return vec![Block::Paragraph(Cell::text("No partition metadata found."))];
+    }
+
+    vec![Block::Table(Table {
+        columns: vec![
+            Cell::text("Partition field"),
+            Cell::text("Field ID"),
+            Cell::text("Metadata"),
+        ],
+        rows: metadata.iter().map(partition_metadata_row).collect(),
+    })]
+}
+
+fn partition_metadata_row(metadata: &ManifestPartitionMetadataSummary) -> Row {
+    Row {
+        cells: vec![
+            Cell::code(metadata.field_name.clone()),
+            metadata.field_id.map_or_else(
+                || Cell::text("unknown"),
+                |id| Cell::value(DocumentValue::Number(i64::from(id))),
+            ),
+            separated_code_cell(partition_metadata_names(metadata)),
+        ],
+    }
+}
+
+fn partition_metadata_names(metadata: &ManifestPartitionMetadataSummary) -> Vec<String> {
+    let mut names = vec!["contains_null".to_string()];
+
+    if metadata.has_contains_nan {
+        names.push("contains_nan".to_string());
+    }
+
+    if metadata.has_lower_bound {
+        names.push("lower_bound".to_string());
+    }
+
+    if metadata.has_upper_bound {
+        names.push("upper_bound".to_string());
+    }
+
+    names
+}
+
+fn column_metadata_blocks(metadata: &[ManifestColumnMetadataSummary]) -> Vec<Block> {
+    if metadata.is_empty() {
+        return vec![Block::Paragraph(Cell::text("No column metadata found."))];
+    }
+
+    vec![Block::Table(Table {
+        columns: vec![
+            Cell::text("Column"),
+            Cell::text("Field ID"),
+            Cell::text("Metadata"),
+        ],
+        rows: metadata.iter().map(column_metadata_row).collect(),
+    })]
+}
+
+fn column_metadata_row(metadata: &ManifestColumnMetadataSummary) -> Row {
+    Row {
+        cells: vec![
+            Cell::code(metadata.column_name.clone()),
+            Cell::value(DocumentValue::Number(i64::from(metadata.field_id))),
+            separated_code_cell(metadata.metadata_fields.clone()),
+        ],
+    }
+}
+
+fn manifest_length_cell(length: i64) -> Cell {
+    match u64::try_from(length) {
+        Ok(length) => Cell::value(DocumentValue::Bytes(length)),
+        Err(_) => Cell::text(format!("invalid: {length}")),
     }
 }
 
@@ -710,6 +1043,27 @@ fn optional_bytes_cell(size_bytes: Option<u64>) -> Cell {
     )
 }
 
+fn optional_u32_cell(value: Option<u32>) -> Cell {
+    value.map_or_else(
+        || Cell::text("unknown"),
+        |value| Cell::value(DocumentValue::Unsigned(u64::from(value))),
+    )
+}
+
+fn optional_u64_cell(value: Option<u64>) -> Cell {
+    value.map_or_else(
+        || Cell::text("unknown"),
+        |value| Cell::value(DocumentValue::Unsigned(value)),
+    )
+}
+
+fn optional_usize_cell(value: Option<usize>) -> Cell {
+    value.map_or_else(
+        || Cell::text("unknown"),
+        |value| Cell::value(DocumentValue::Count(value)),
+    )
+}
+
 fn table_stats_header_properties(
     source_endpoint: String,
     retrieved_at: OffsetDateTime,
@@ -879,27 +1233,37 @@ fn flatten_fields(
             None => field.name.clone(),
         };
 
-        if identifier_ids.contains(&field.id) {
-            identifier_fields.push(path.clone());
-        }
-
-        rows.push(Row {
-            cells: vec![
-                Cell::code(path.clone()),
-                Cell::code(type_summary(&field.field_type)),
-                Cell::value(DocumentValue::Bool(field.required)),
-                Cell::value(DocumentValue::Number(i64::from(field.id))),
-            ],
-        });
-
-        flatten_nested_type(
-            &field.field_type,
-            &path,
-            identifier_ids,
-            identifier_fields,
-            rows,
-        );
+        flatten_field(field, &path, identifier_ids, identifier_fields, rows);
     }
+}
+
+fn flatten_field(
+    field: &NestedFieldRef,
+    path: &str,
+    identifier_ids: &HashSet<i32>,
+    identifier_fields: &mut Vec<String>,
+    rows: &mut Vec<Row>,
+) {
+    if identifier_ids.contains(&field.id) {
+        identifier_fields.push(path.to_string());
+    }
+
+    rows.push(Row {
+        cells: vec![
+            Cell::code(path.to_string()),
+            Cell::code(type_summary(&field.field_type)),
+            Cell::value(DocumentValue::Bool(field.required)),
+            Cell::value(DocumentValue::Number(i64::from(field.id))),
+        ],
+    });
+
+    flatten_nested_type(
+        &field.field_type,
+        path,
+        identifier_ids,
+        identifier_fields,
+        rows,
+    );
 }
 
 fn flatten_nested_type(
@@ -917,21 +1281,50 @@ fn flatten_nested_type(
             identifier_fields,
             rows,
         ),
-        Type::List(list_type) => flatten_nested_type(
-            &list_type.element_field.field_type,
-            &format!("{path}[]"),
-            identifier_ids,
-            identifier_fields,
-            rows,
-        ),
-        Type::Map(map_type) => flatten_nested_type(
-            &map_type.value_field.field_type,
-            &format!("{path}{{}}"),
-            identifier_ids,
-            identifier_fields,
-            rows,
-        ),
+        Type::List(list_type) => {
+            let element_path = list_element_path(path);
+            flatten_field(
+                &list_type.element_field,
+                &element_path,
+                identifier_ids,
+                identifier_fields,
+                rows,
+            );
+        }
+        Type::Map(map_type) => {
+            let key_path = map_key_path(path);
+            flatten_field(
+                &map_type.key_field,
+                &key_path,
+                identifier_ids,
+                identifier_fields,
+                rows,
+            );
+            let value_path = map_value_path(path, &map_type.value_field.field_type);
+            flatten_field(
+                &map_type.value_field,
+                &value_path,
+                identifier_ids,
+                identifier_fields,
+                rows,
+            );
+        }
         Type::Primitive(_) => {}
+    }
+}
+
+fn list_element_path(path: &str) -> String {
+    format!("{path}[]")
+}
+
+fn map_key_path(path: &str) -> String {
+    format!("{path}{{}}.key")
+}
+
+fn map_value_path(path: &str, value_type: &Type) -> String {
+    match value_type {
+        Type::Struct(_) | Type::List(_) | Type::Map(_) => format!("{path}{{}}"),
+        Type::Primitive(_) => format!("{path}{{}}.value"),
     }
 }
 
@@ -953,18 +1346,21 @@ mod tests {
     use std::sync::Arc;
 
     use crate::engine::{
-        CurrentDataFileSizeStats, CurrentTablePartitionStats, CurrentTablePartitions,
-        CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
+        CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
+        CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableStats,
+        DataFileSizeBucketStats, DataFileSizeDistribution, ManifestColumnMetadataSummary,
+        ManifestFileListEntry, ManifestPartitionMetadataSummary,
     };
     use crate::spec::{
-        ListType, MapType, NestedField, NestedFieldRef, PartitionSpec, PrimitiveType, Schema,
-        StructType, Transform, Type,
+        ListType, ManifestContentType, ManifestFile, MapType, NestedField, NestedFieldRef,
+        PartitionSpec, PrimitiveType, Schema, StructType, Transform, Type,
     };
     use time::OffsetDateTime;
 
     use super::{
-        Block, Cell, DocumentValue, data_file_size_stats_document, schema_document,
-        table_partitions_document, table_stats_document,
+        Block, Cell, DocumentValue, data_file_size_stats_document, manifest_file_detail_document,
+        manifest_file_list_document, schema_document, table_partitions_document,
+        table_stats_document,
     };
 
     fn nested_schema() -> Schema {
@@ -1062,6 +1458,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "document shape assertions are intentionally explicit"
+    )]
     fn builds_current_schema_document() {
         let schema = nested_schema();
 
@@ -1095,7 +1495,7 @@ mod tests {
             "Total field count including nested fields",
             properties[5].label
         );
-        assert_eq!(Cell::value(DocumentValue::Count(9)), properties[5].value);
+        assert_eq!(Cell::value(DocumentValue::Count(17)), properties[5].value);
 
         let Block::Section(section) = &document.blocks[1] else {
             panic!("second block should be a section");
@@ -1127,12 +1527,39 @@ mod tests {
         );
         assert_eq!(
             vec![
+                Cell::code("metadata.labels{}.key"),
+                Cell::code("string"),
+                Cell::value(DocumentValue::Bool(true)),
+                Cell::value(DocumentValue::Number(4)),
+            ],
+            table.rows[3].cells
+        );
+        assert_eq!(
+            vec![
+                Cell::code("metadata.labels{}.value"),
+                Cell::code("string"),
+                Cell::value(DocumentValue::Bool(false)),
+                Cell::value(DocumentValue::Number(5)),
+            ],
+            table.rows[4].cells
+        );
+        assert_eq!(
+            vec![
+                Cell::code("containers[]"),
+                Cell::code("struct"),
+                Cell::value(DocumentValue::Bool(false)),
+                Cell::value(DocumentValue::Number(7)),
+            ],
+            table.rows[6].cells
+        );
+        assert_eq!(
+            vec![
                 Cell::code("containers[].name"),
                 Cell::code("string"),
                 Cell::value(DocumentValue::Bool(false)),
                 Cell::value(DocumentValue::Number(8)),
             ],
-            table.rows[4].cells
+            table.rows[7].cells
         );
         assert_eq!(
             vec![
@@ -1141,7 +1568,7 @@ mod tests {
                 Cell::value(DocumentValue::Bool(false)),
                 Cell::value(DocumentValue::Number(12)),
             ],
-            table.rows[6].cells
+            table.rows[11].cells
         );
         assert_eq!(
             vec![
@@ -1150,7 +1577,7 @@ mod tests {
                 Cell::value(DocumentValue::Bool(false)),
                 Cell::value(DocumentValue::Number(17)),
             ],
-            table.rows[8].cells
+            table.rows[16].cells
         );
     }
 
@@ -1373,6 +1800,293 @@ mod tests {
                 Cell::value(DocumentValue::PercentageMillis(50_000)),
             ],
             bucket_table.rows[0].cells
+        );
+    }
+
+    #[test]
+    fn builds_manifest_file_list_document() {
+        let manifest_files = CurrentManifestFileList {
+            snapshot_id: 42,
+            snapshot_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
+                .expect("valid timestamp"),
+            manifest_list_path: "s3://warehouse/table/metadata/snap-42.avro".to_string(),
+            files: vec![ManifestFileListEntry {
+                id: "m1".to_string(),
+                name: "manifest-1.avro".to_string(),
+                path: "s3://warehouse/table/metadata/manifest-1.avro".to_string(),
+                content: ManifestContentType::Data,
+                size_bytes: 2048,
+                partition_spec_id: 7,
+                added_files_count: Some(2),
+                existing_files_count: Some(5),
+                deleted_files_count: Some(1),
+            }],
+        };
+
+        let document = manifest_file_list_document(
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
+            &manifest_files,
+        );
+
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Text("Manifest Files: ".to_string()),
+                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+            ]),
+            document.title
+        );
+
+        let Block::Properties(properties) = &document.blocks[0] else {
+            panic!("first block should be properties");
+        };
+        assert_eq!("Manifest files", properties[5].label);
+        assert_eq!(Cell::value(DocumentValue::Count(1)), properties[5].value);
+
+        let Block::Section(files_section) = &document.blocks[1] else {
+            panic!("second block should be files section");
+        };
+        let Block::Table(files_table) = &files_section.blocks[0] else {
+            panic!("files section should contain a table");
+        };
+        assert_eq!(Cell::text("Manifest Files"), files_section.title);
+        assert_eq!(
+            vec![
+                Cell::text("ID"),
+                Cell::text("Name"),
+                Cell::text("Content"),
+                Cell::text("Size"),
+                Cell::text("Partition spec ID"),
+                Cell::text("Added files"),
+                Cell::text("Existing files"),
+                Cell::text("Deleted files")
+            ],
+            files_table.columns
+        );
+        assert_eq!(
+            vec![
+                Cell::code("m1"),
+                Cell::code("manifest-1.avro"),
+                Cell::code("data"),
+                Cell::value(DocumentValue::Bytes(2048)),
+                Cell::value(DocumentValue::Number(7)),
+                Cell::value(DocumentValue::Unsigned(2)),
+                Cell::value(DocumentValue::Unsigned(5)),
+                Cell::value(DocumentValue::Unsigned(1)),
+            ],
+            files_table.rows[0].cells
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "document shape assertions are intentionally explicit"
+    )]
+    fn builds_manifest_file_detail_document() {
+        let detail = CurrentManifestFileDetail {
+            snapshot_id: 42,
+            snapshot_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
+                .expect("valid timestamp"),
+            manifest_list_path: "s3://warehouse/table/metadata/snap-42.avro".to_string(),
+            manifest_file_count: 3,
+            manifest_file_id: "m1".to_string(),
+            manifest_file: ManifestFile {
+                manifest_path: "s3://warehouse/table/metadata/manifest-1.avro".to_string(),
+                manifest_length: 2048,
+                partition_spec_id: 7,
+                content: ManifestContentType::Data,
+                sequence_number: 11,
+                min_sequence_number: 9,
+                added_snapshot_id: 42,
+                added_files_count: Some(2),
+                existing_files_count: Some(5),
+                deleted_files_count: Some(1),
+                added_rows_count: Some(200),
+                existing_rows_count: Some(500),
+                deleted_rows_count: Some(100),
+                partitions: Some(Vec::new()),
+                key_metadata: Some(vec![1, 2, 3]),
+                first_row_id: Some(10_000),
+            },
+            partition_metadata: vec![
+                ManifestPartitionMetadataSummary {
+                    field_name: "org_id".to_string(),
+                    field_id: Some(1000),
+                    has_contains_nan: true,
+                    has_lower_bound: true,
+                    has_upper_bound: true,
+                },
+                ManifestPartitionMetadataSummary {
+                    field_name: "day_bucket".to_string(),
+                    field_id: Some(1001),
+                    has_contains_nan: false,
+                    has_lower_bound: true,
+                    has_upper_bound: false,
+                },
+            ],
+            column_metadata: vec![
+                ManifestColumnMetadataSummary {
+                    column_name: "org_id".to_string(),
+                    field_id: 1,
+                    metadata_fields: vec![
+                        "column_sizes".to_string(),
+                        "value_counts".to_string(),
+                        "null_value_counts".to_string(),
+                        "lower_bounds".to_string(),
+                        "upper_bounds".to_string(),
+                    ],
+                },
+                ManifestColumnMetadataSummary {
+                    column_name: "metadata.labels".to_string(),
+                    field_id: 3,
+                    metadata_fields: vec!["column_sizes".to_string()],
+                },
+            ],
+        };
+
+        let document = manifest_file_detail_document(
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
+            &detail,
+        );
+
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Text("Manifest File: ".to_string()),
+                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string()),
+                DocumentValue::Text(" ".to_string()),
+                DocumentValue::Code("m1".to_string())
+            ]),
+            document.title
+        );
+
+        let Block::Properties(properties) = &document.blocks[0] else {
+            panic!("first block should be properties");
+        };
+        assert_eq!("Snapshot ID", properties[2].label);
+        assert_eq!("Manifest list", properties[4].label);
+        assert_eq!("Manifest files", properties[5].label);
+        assert_eq!(Cell::value(DocumentValue::Unsigned(3)), properties[5].value);
+        assert_eq!("Manifest file ID", properties[6].label);
+        assert_eq!(Cell::code("m1"), properties[6].value);
+
+        let Block::Section(detail_section) = &document.blocks[1] else {
+            panic!("second block should be manifest file section");
+        };
+        let Block::Properties(detail_properties) = &detail_section.blocks[0] else {
+            panic!("manifest file section should contain properties");
+        };
+        assert_eq!(Cell::text("Manifest File"), detail_section.title);
+        assert_eq!("Path", detail_properties[0].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Uri(
+                "s3://warehouse/table/metadata/manifest-1.avro".to_string()
+            )),
+            detail_properties[0].value
+        );
+        assert_eq!("Content", detail_properties[1].label);
+        assert_eq!(Cell::code("data"), detail_properties[1].value);
+        assert_eq!("Length", detail_properties[2].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Bytes(2048)),
+            detail_properties[2].value
+        );
+        assert_eq!("First row ID", detail_properties[15].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Unsigned(10_000)),
+            detail_properties[15].value
+        );
+
+        let Block::Section(partition_metadata_section) = &document.blocks[2] else {
+            panic!("third block should be partition metadata section");
+        };
+        let Block::Table(partition_metadata_table) = &partition_metadata_section.blocks[0] else {
+            panic!("partition metadata section should contain a table");
+        };
+        assert_eq!(
+            Cell::text("Partition Metadata"),
+            partition_metadata_section.title
+        );
+        assert_eq!(
+            vec![
+                Cell::text("Partition field"),
+                Cell::text("Field ID"),
+                Cell::text("Metadata")
+            ],
+            partition_metadata_table.columns
+        );
+        assert_eq!(
+            vec![
+                Cell::code("org_id"),
+                Cell::value(DocumentValue::Number(1000)),
+                Cell::new(vec![
+                    DocumentValue::Code("contains_null".to_string()),
+                    DocumentValue::Text(", ".to_string()),
+                    DocumentValue::Code("contains_nan".to_string()),
+                    DocumentValue::Text(", ".to_string()),
+                    DocumentValue::Code("lower_bound".to_string()),
+                    DocumentValue::Text(", ".to_string()),
+                    DocumentValue::Code("upper_bound".to_string()),
+                ]),
+            ],
+            partition_metadata_table.rows[0].cells
+        );
+        assert_eq!(
+            vec![
+                Cell::code("day_bucket"),
+                Cell::value(DocumentValue::Number(1001)),
+                Cell::new(vec![
+                    DocumentValue::Code("contains_null".to_string()),
+                    DocumentValue::Text(", ".to_string()),
+                    DocumentValue::Code("lower_bound".to_string()),
+                ]),
+            ],
+            partition_metadata_table.rows[1].cells
+        );
+
+        let Block::Section(column_metadata_section) = &document.blocks[3] else {
+            panic!("fourth block should be column metadata section");
+        };
+        let Block::Table(column_metadata_table) = &column_metadata_section.blocks[0] else {
+            panic!("column metadata section should contain a table");
+        };
+        assert_eq!(Cell::text("Column Metadata"), column_metadata_section.title);
+        assert_eq!(
+            vec![
+                Cell::text("Column"),
+                Cell::text("Field ID"),
+                Cell::text("Metadata")
+            ],
+            column_metadata_table.columns
+        );
+        assert_eq!(
+            vec![
+                Cell::code("org_id"),
+                Cell::value(DocumentValue::Number(1)),
+                Cell::new(vec![
+                    DocumentValue::Code("column_sizes".to_string()),
+                    DocumentValue::Text(", ".to_string()),
+                    DocumentValue::Code("value_counts".to_string()),
+                    DocumentValue::Text(", ".to_string()),
+                    DocumentValue::Code("null_value_counts".to_string()),
+                    DocumentValue::Text(", ".to_string()),
+                    DocumentValue::Code("lower_bounds".to_string()),
+                    DocumentValue::Text(", ".to_string()),
+                    DocumentValue::Code("upper_bounds".to_string()),
+                ]),
+            ],
+            column_metadata_table.rows[0].cells
+        );
+        assert_eq!(
+            vec![
+                Cell::code("metadata.labels"),
+                Cell::value(DocumentValue::Number(3)),
+                Cell::new(vec![DocumentValue::Code("column_sizes".to_string())]),
+            ],
+            column_metadata_table.rows[1].cells
         );
     }
 

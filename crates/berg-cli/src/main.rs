@@ -4,12 +4,14 @@ use std::fmt::Write;
 
 use anyhow::{Context, anyhow};
 use berg_core::engine::{
-    QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats, load_current_schema,
+    QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats,
+    load_current_manifest_file_detail, load_current_manifest_file_list, load_current_schema,
     load_current_table_partitions, load_current_table_stats, parse_catalog_property,
 };
 use berg_core::view::{
     Block, Cell, Document, DocumentValue, List, ListKind, data_file_size_stats_document,
-    schema_document, table_partitions_document, table_stats_document,
+    manifest_file_detail_document, manifest_file_list_document, schema_document,
+    table_partitions_document, table_stats_document,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use time::format_description::well_known::Rfc3339;
@@ -112,8 +114,6 @@ struct CatalogArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Inspect Iceberg table schemas.
-    Schema(SchemaArgs),
     /// Inspect Iceberg tables.
     Table(TableArgs),
     /// Print the full command tree.
@@ -130,13 +130,33 @@ struct CommandTreeArgs {
 }
 
 #[derive(Debug, Args)]
-struct SchemaArgs {
+struct TableArgs {
     #[command(subcommand)]
-    command: SchemaCommands,
+    command: TableCommands,
 }
 
 #[derive(Debug, Subcommand)]
-enum SchemaCommands {
+enum TableCommands {
+    /// Inspect Iceberg table files.
+    Files(TableFilesArgs),
+    /// Inspect Iceberg table manifests.
+    Manifest(TableManifestArgs),
+    /// Inspect Iceberg table partitions.
+    Partitions(TablePartitionsArgs),
+    /// Inspect Iceberg table schemas.
+    Schema(TableSchemaArgs),
+    /// Inspect Iceberg table statistics.
+    Stats(TableStatsArgs),
+}
+
+#[derive(Debug, Args)]
+struct TableSchemaArgs {
+    #[command(subcommand)]
+    command: TableSchemaCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum TableSchemaCommands {
     /// Show the current schema for a fully-qualified table ID.
     Current(CurrentSchemaArgs),
 }
@@ -148,22 +168,6 @@ struct CurrentSchemaArgs {
 
     #[command(flatten)]
     output: DocumentOutputArgs,
-}
-
-#[derive(Debug, Args)]
-struct TableArgs {
-    #[command(subcommand)]
-    command: TableCommands,
-}
-
-#[derive(Debug, Subcommand)]
-enum TableCommands {
-    /// Inspect Iceberg table files.
-    Files(TableFilesArgs),
-    /// Inspect Iceberg table partitions.
-    Partitions(TablePartitionsArgs),
-    /// Inspect Iceberg table statistics.
-    Stats(TableStatsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -188,6 +192,39 @@ struct TableFilesDataArgs {
 enum TableFilesDataCommands {
     /// Show data file size statistics for the current snapshot of a fully-qualified table ID.
     Stats(DataFileSizeStatsArgs),
+}
+
+#[derive(Debug, Args)]
+struct TableManifestArgs {
+    #[command(subcommand)]
+    command: TableManifestCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum TableManifestCommands {
+    /// Inspect Iceberg manifest files.
+    Files(TableManifestFilesArgs),
+}
+
+#[derive(Debug, Args)]
+struct TableManifestFilesArgs {
+    /// Manifest file ID from `table manifest files list`.
+    manifest_file_id: Option<String>,
+
+    /// Fully-qualified table ID: catalog.namespace.table.
+    table: Option<String>,
+
+    #[command(flatten)]
+    output: DocumentOutputArgs,
+
+    #[command(subcommand)]
+    command: Option<TableManifestFilesCommands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum TableManifestFilesCommands {
+    /// List manifest files for the current snapshot of a fully-qualified table ID.
+    List(ManifestFileListArgs),
 }
 
 #[derive(Debug, Args)]
@@ -242,6 +279,15 @@ struct DataFileSizeStatsArgs {
 }
 
 #[derive(Debug, Args)]
+struct ManifestFileListArgs {
+    /// Fully-qualified table ID: catalog.namespace.table.
+    table: String,
+
+    #[command(flatten)]
+    output: DocumentOutputArgs,
+}
+
+#[derive(Debug, Args)]
 struct DocumentOutputArgs {
     /// Output format for document-producing commands.
     #[arg(
@@ -269,9 +315,6 @@ async fn main() -> anyhow::Result<()> {
     let catalog_args = cli.catalog;
 
     match cli.command {
-        Some(Commands::Schema(schema_args)) => match schema_args.command {
-            SchemaCommands::Current(args) => print_current_schema(args, catalog_args).await?,
-        },
         Some(Commands::Table(table_args)) => match table_args.command {
             TableCommands::Files(files_args) => match files_args.command {
                 TableFilesCommands::Data(data_args) => match data_args.command {
@@ -280,9 +323,19 @@ async fn main() -> anyhow::Result<()> {
                     }
                 },
             },
+            TableCommands::Manifest(manifest_args) => match manifest_args.command {
+                TableManifestCommands::Files(files_args) => {
+                    print_manifest_files(files_args, catalog_args).await?;
+                }
+            },
             TableCommands::Partitions(partitions_args) => match partitions_args.command {
                 TablePartitionsCommands::Current(args) => {
                     print_current_table_partitions(args, catalog_args).await?;
+                }
+            },
+            TableCommands::Schema(schema_args) => match schema_args.command {
+                TableSchemaCommands::Current(args) => {
+                    print_current_schema(args, catalog_args).await?;
                 }
             },
             TableCommands::Stats(stats_args) => match stats_args.command {
@@ -445,6 +498,104 @@ async fn print_data_file_size_stats(
         config.table_endpoint(table.table()),
         OffsetDateTime::now_utc(),
         &stats,
+    );
+
+    print!("{}", render_document(&document, args.output.format)?);
+
+    Ok(())
+}
+
+async fn print_manifest_files(
+    args: TableManifestFilesArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<()> {
+    let TableManifestFilesArgs {
+        manifest_file_id,
+        table,
+        output,
+        command,
+    } = args;
+
+    match command {
+        Some(TableManifestFilesCommands::List(args)) => {
+            print_manifest_file_list(args, catalog_args).await
+        }
+        None => {
+            let manifest_file_id = manifest_file_id.ok_or_else(|| {
+                anyhow!("expected manifest file id: table manifest files <id> <table>")
+            })?;
+            let table = table.ok_or_else(|| {
+                anyhow!("expected table identifier: table manifest files <id> <table>")
+            })?;
+
+            print_manifest_file_detail(
+                ManifestFileDetailArgs {
+                    manifest_file_id,
+                    table,
+                    output,
+                },
+                catalog_args,
+            )
+            .await
+        }
+    }
+}
+
+async fn print_manifest_file_list(
+    args: ManifestFileListArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<()> {
+    let table = QualifiedTableIdent::parse(&args.table)?;
+    let config = rest_catalog_config(catalog_args, &table)?;
+
+    let manifest_files = load_current_manifest_file_list(&config, table.table())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load current manifest files for `{}`",
+                table.display_name()
+            )
+        })?;
+    let document = manifest_file_list_document(
+        table.display_name(),
+        config.table_endpoint(table.table()),
+        OffsetDateTime::now_utc(),
+        &manifest_files,
+    );
+
+    print!("{}", render_document(&document, args.output.format)?);
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ManifestFileDetailArgs {
+    manifest_file_id: String,
+    table: String,
+    output: DocumentOutputArgs,
+}
+
+async fn print_manifest_file_detail(
+    args: ManifestFileDetailArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<()> {
+    let table = QualifiedTableIdent::parse(&args.table)?;
+    let config = rest_catalog_config(catalog_args, &table)?;
+
+    let detail = load_current_manifest_file_detail(&config, table.table(), &args.manifest_file_id)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load current manifest file `{}` for `{}`",
+                args.manifest_file_id,
+                table.display_name()
+            )
+        })?;
+    let document = manifest_file_detail_document(
+        table.display_name(),
+        config.table_endpoint(table.table()),
+        OffsetDateTime::now_utc(),
+        &detail,
     );
 
     print!("{}", render_document(&document, args.output.format)?);
@@ -1175,13 +1326,16 @@ mod tests {
         let tree = command_tree();
 
         assert!(tree.contains("berg - Command-line interface for Berg."));
-        assert!(tree.contains("├── schema - Inspect Iceberg table schemas"));
-        assert!(tree.contains("│   └── current - Show the current schema"));
         assert!(tree.contains("├── table - Inspect Iceberg tables"));
         assert!(tree.contains("│   ├── files - Inspect Iceberg table files"));
         assert!(tree.contains("│   │   └── data - Inspect Iceberg data files"));
         assert!(tree.contains("│   │       └── stats - Show data file size statistics"));
+        assert!(tree.contains("│   ├── manifest - Inspect Iceberg table manifests"));
+        assert!(tree.contains("│   │   └── files - Inspect Iceberg manifest files"));
+        assert!(tree.contains("│   │       └── list - List manifest files"));
         assert!(tree.contains("│   ├── partitions - Inspect Iceberg table partitions"));
+        assert!(tree.contains("│   ├── schema - Inspect Iceberg table schemas"));
+        assert!(tree.contains("│   │   └── current - Show the current schema"));
         assert!(tree.contains("│   └── stats - Inspect Iceberg table statistics"));
         assert!(tree.contains("└── commands - Print the full command tree"));
     }

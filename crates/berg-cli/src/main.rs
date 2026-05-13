@@ -114,7 +114,7 @@ struct CatalogArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Inspect Iceberg tables.
+    /// Inspect tables.
     Table(TableArgs),
     /// Print the full command tree.
     #[command(name = "commands")]
@@ -137,15 +137,15 @@ struct TableArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableCommands {
-    /// Inspect Iceberg table data.
+    /// Inspect table data.
     Data(TableDataArgs),
-    /// Inspect Iceberg table manifests.
+    /// Inspect table manifests.
     Manifest(TableManifestArgs),
-    /// Inspect Iceberg table partitions.
+    /// Inspect table partitions.
     Partitions(TablePartitionsArgs),
-    /// Inspect Iceberg table schemas.
+    /// Inspect table schemas.
     Schema(TableSchemaArgs),
-    /// Inspect Iceberg table statistics.
+    /// Inspect table statistics.
     Stats(TableStatsArgs),
 }
 
@@ -157,13 +157,14 @@ struct TableSchemaArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableSchemaCommands {
-    /// Show the current schema for a fully-qualified table ID.
+    /// Show the current schema.
     Current(CurrentSchemaArgs),
 }
 
 #[derive(Debug, Args)]
 struct CurrentSchemaArgs {
-    /// Fully-qualified table ID: catalog.namespace.table.
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
     table: String,
 
     #[command(flatten)]
@@ -178,7 +179,7 @@ struct TableDataArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableDataCommands {
-    /// Inspect Iceberg data files.
+    /// Inspect data files.
     Files(TableDataFilesArgs),
 }
 
@@ -190,7 +191,7 @@ struct TableDataFilesArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableDataFilesCommands {
-    /// Show data file size statistics for the current snapshot of a fully-qualified table ID.
+    /// Show data file size statistics for the current snapshot.
     Stats(DataFileSizeStatsArgs),
 }
 
@@ -202,29 +203,22 @@ struct TableManifestArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableManifestCommands {
-    /// Inspect Iceberg manifest files.
+    /// Inspect manifest files.
     Files(TableManifestFilesArgs),
 }
 
 #[derive(Debug, Args)]
 struct TableManifestFilesArgs {
-    /// Manifest file ID from `table manifest files list`.
-    manifest_file_id: Option<String>,
-
-    /// Fully-qualified table ID: catalog.namespace.table.
-    table: Option<String>,
-
-    #[command(flatten)]
-    output: DocumentOutputArgs,
-
     #[command(subcommand)]
-    command: Option<TableManifestFilesCommands>,
+    command: TableManifestFilesCommands,
 }
 
 #[derive(Debug, Subcommand)]
 enum TableManifestFilesCommands {
-    /// List manifest files for the current snapshot of a fully-qualified table ID.
+    /// List manifest files for the current snapshot.
     List(ManifestFileListArgs),
+    /// Inspect one manifest file from the current snapshot.
+    Inspect(ManifestFileDetailArgs),
 }
 
 #[derive(Debug, Args)]
@@ -235,13 +229,14 @@ struct TablePartitionsArgs {
 
 #[derive(Debug, Subcommand)]
 enum TablePartitionsCommands {
-    /// Show the current partition spec and current snapshot partitions for a fully-qualified table ID.
+    /// Show the current partition spec and current snapshot partitions.
     Current(CurrentTablePartitionsArgs),
 }
 
 #[derive(Debug, Args)]
 struct CurrentTablePartitionsArgs {
-    /// Fully-qualified table ID: catalog.namespace.table.
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
     table: String,
 
     #[command(flatten)]
@@ -256,13 +251,14 @@ struct TableStatsArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableStatsCommands {
-    /// Show statistics for the current snapshot of a fully-qualified table ID.
+    /// Show statistics for the current snapshot.
     Current(CurrentTableStatsArgs),
 }
 
 #[derive(Debug, Args)]
 struct CurrentTableStatsArgs {
-    /// Fully-qualified table ID: catalog.namespace.table.
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
     table: String,
 
     #[command(flatten)]
@@ -271,7 +267,8 @@ struct CurrentTableStatsArgs {
 
 #[derive(Debug, Args)]
 struct DataFileSizeStatsArgs {
-    /// Fully-qualified table ID: catalog.namespace.table.
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
     table: String,
 
     #[command(flatten)]
@@ -280,7 +277,8 @@ struct DataFileSizeStatsArgs {
 
 #[derive(Debug, Args)]
 struct ManifestFileListArgs {
-    /// Fully-qualified table ID: catalog.namespace.table.
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
     table: String,
 
     #[command(flatten)]
@@ -509,34 +507,12 @@ async fn print_manifest_files(
     args: TableManifestFilesArgs,
     catalog_args: CatalogArgs,
 ) -> anyhow::Result<()> {
-    let TableManifestFilesArgs {
-        manifest_file_id,
-        table,
-        output,
-        command,
-    } = args;
-
-    match command {
-        Some(TableManifestFilesCommands::List(args)) => {
+    match args.command {
+        TableManifestFilesCommands::List(args) => {
             print_manifest_file_list(args, catalog_args).await
         }
-        None => {
-            let manifest_file_id = manifest_file_id.ok_or_else(|| {
-                anyhow!("expected manifest file id: table manifest files <id> <table>")
-            })?;
-            let table = table.ok_or_else(|| {
-                anyhow!("expected table identifier: table manifest files <id> <table>")
-            })?;
-
-            print_manifest_file_detail(
-                ManifestFileDetailArgs {
-                    manifest_file_id,
-                    table,
-                    output,
-                },
-                catalog_args,
-            )
-            .await
+        TableManifestFilesCommands::Inspect(args) => {
+            print_manifest_file_detail(args, catalog_args).await
         }
     }
 }
@@ -568,10 +544,17 @@ async fn print_manifest_file_list(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Args)]
 struct ManifestFileDetailArgs {
+    /// Manifest ID from `table manifest files list`.
+    #[arg(value_name = "manifest-id")]
     manifest_file_id: String,
+
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
     table: String,
+
+    #[command(flatten)]
     output: DocumentOutputArgs,
 }
 
@@ -1326,17 +1309,24 @@ mod tests {
         let tree = command_tree();
 
         assert!(tree.contains("berg - Command-line interface for Berg."));
-        assert!(tree.contains("├── table - Inspect Iceberg tables"));
-        assert!(tree.contains("│   ├── data - Inspect Iceberg table data"));
-        assert!(tree.contains("│   │   └── files - Inspect Iceberg data files"));
-        assert!(tree.contains("│   │       └── stats - Show data file size statistics"));
-        assert!(tree.contains("│   ├── manifest - Inspect Iceberg table manifests"));
-        assert!(tree.contains("│   │   └── files - Inspect Iceberg manifest files"));
-        assert!(tree.contains("│   │       └── list - List manifest files"));
-        assert!(tree.contains("│   ├── partitions - Inspect Iceberg table partitions"));
-        assert!(tree.contains("│   ├── schema - Inspect Iceberg table schemas"));
+        assert!(tree.contains("├── table - Inspect tables"));
+        assert!(tree.contains("│   ├── data - Inspect table data"));
+        assert!(tree.contains("│   │   └── files - Inspect data files"));
+        assert!(tree.contains(
+            "│   │       └── stats - Show data file size statistics for the current snapshot"
+        ));
+        assert!(tree.contains("│   ├── manifest - Inspect table manifests"));
+        assert!(tree.contains("│   │   └── files - Inspect manifest files"));
+        assert!(
+            tree.contains("│   │       ├── list - List manifest files for the current snapshot")
+        );
+        assert!(tree.contains(
+            "│   │       └── inspect - Inspect one manifest file from the current snapshot"
+        ));
+        assert!(tree.contains("│   ├── partitions - Inspect table partitions"));
+        assert!(tree.contains("│   ├── schema - Inspect table schemas"));
         assert!(tree.contains("│   │   └── current - Show the current schema"));
-        assert!(tree.contains("│   └── stats - Inspect Iceberg table statistics"));
+        assert!(tree.contains("│   └── stats - Inspect table statistics"));
         assert!(tree.contains("└── commands - Print the full command tree"));
     }
 }

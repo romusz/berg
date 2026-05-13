@@ -137,8 +137,8 @@ struct TableArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableCommands {
-    /// Inspect Iceberg table files.
-    Files(TableFilesArgs),
+    /// Inspect Iceberg table data.
+    Data(TableDataArgs),
     /// Inspect Iceberg table manifests.
     Manifest(TableManifestArgs),
     /// Inspect Iceberg table partitions.
@@ -171,25 +171,25 @@ struct CurrentSchemaArgs {
 }
 
 #[derive(Debug, Args)]
-struct TableFilesArgs {
+struct TableDataArgs {
     #[command(subcommand)]
-    command: TableFilesCommands,
+    command: TableDataCommands,
 }
 
 #[derive(Debug, Subcommand)]
-enum TableFilesCommands {
+enum TableDataCommands {
     /// Inspect Iceberg data files.
-    Data(TableFilesDataArgs),
+    Files(TableDataFilesArgs),
 }
 
 #[derive(Debug, Args)]
-struct TableFilesDataArgs {
+struct TableDataFilesArgs {
     #[command(subcommand)]
-    command: TableFilesDataCommands,
+    command: TableDataFilesCommands,
 }
 
 #[derive(Debug, Subcommand)]
-enum TableFilesDataCommands {
+enum TableDataFilesCommands {
     /// Show data file size statistics for the current snapshot of a fully-qualified table ID.
     Stats(DataFileSizeStatsArgs),
 }
@@ -316,9 +316,9 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Table(table_args)) => match table_args.command {
-            TableCommands::Files(files_args) => match files_args.command {
-                TableFilesCommands::Data(data_args) => match data_args.command {
-                    TableFilesDataCommands::Stats(args) => {
+            TableCommands::Data(data_args) => match data_args.command {
+                TableDataCommands::Files(files_args) => match files_args.command {
+                    TableDataFilesCommands::Stats(args) => {
                         print_data_file_size_stats(args, catalog_args).await?;
                     }
                 },
@@ -1327,8 +1327,8 @@ mod tests {
 
         assert!(tree.contains("berg - Command-line interface for Berg."));
         assert!(tree.contains("├── table - Inspect Iceberg tables"));
-        assert!(tree.contains("│   ├── files - Inspect Iceberg table files"));
-        assert!(tree.contains("│   │   └── data - Inspect Iceberg data files"));
+        assert!(tree.contains("│   ├── data - Inspect Iceberg table data"));
+        assert!(tree.contains("│   │   └── files - Inspect Iceberg data files"));
         assert!(tree.contains("│   │       └── stats - Show data file size statistics"));
         assert!(tree.contains("│   ├── manifest - Inspect Iceberg table manifests"));
         assert!(tree.contains("│   │   └── files - Inspect Iceberg manifest files"));

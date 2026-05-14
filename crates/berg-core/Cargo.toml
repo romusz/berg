@@ -15,6 +15,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
+flate2.workspace = true
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-storage-opendal.workspace = true

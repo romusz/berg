@@ -1131,11 +1131,19 @@ fn table_file_properties(stats: &CurrentTableStats) -> Vec<Property> {
 }
 
 fn metadata_file_properties(stats: &CurrentTableStats, total_metadata_size: u64) -> Vec<Property> {
-    vec![
-        Property {
+    let mut properties = vec![Property {
+        label: "Metadata JSON size".to_string(),
+        value: metadata_json_size_cell(stats),
+    }];
+
+    if stats.metadata_json_compressed {
+        properties.push(Property {
             label: "Metadata JSON size".to_string(),
-            value: metadata_json_size_cell(stats),
-        },
+            value: metadata_json_uncompressed_size_cell(stats),
+        });
+    }
+
+    properties.extend([
         Property {
             label: "Manifest list size".to_string(),
             value: Cell::value(DocumentValue::Bytes(stats.manifest_list_size_bytes)),
@@ -1156,7 +1164,9 @@ fn metadata_file_properties(stats: &CurrentTableStats, total_metadata_size: u64)
             label: "Metadata overhead".to_string(),
             value: metadata_overhead_cell(total_metadata_size, stats.total_table_file_size_bytes),
         },
-    ]
+    ]);
+
+    properties
 }
 
 fn utc_and_local_timestamp_cell(timestamp: OffsetDateTime) -> Cell {
@@ -1175,6 +1185,13 @@ fn metadata_json_size_cell(stats: &CurrentTableStats) -> Cell {
         } else {
             ", uncompressed".to_string()
         }),
+    ])
+}
+
+fn metadata_json_uncompressed_size_cell(stats: &CurrentTableStats) -> Cell {
+    Cell::new(vec![
+        DocumentValue::Bytes(stats.metadata_json_uncompressed_size_bytes),
+        DocumentValue::Text(", uncompressed".to_string()),
     ])
 }
 
@@ -1601,6 +1618,7 @@ mod tests {
             manifest_list_size_bytes: 100,
             manifest_files_size_bytes: 200,
             metadata_json_size_bytes: 300,
+            metadata_json_uncompressed_size_bytes: 900,
         };
 
         let document = table_stats_document(
@@ -1664,18 +1682,26 @@ mod tests {
             ]),
             metadata_file_properties[0].value
         );
-        assert_eq!("Total metadata files", metadata_file_properties[4].label);
+        assert_eq!("Metadata JSON size", metadata_file_properties[1].label);
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Bytes(900),
+                DocumentValue::Text(", uncompressed".to_string())
+            ]),
+            metadata_file_properties[1].value
+        );
+        assert_eq!("Total metadata files", metadata_file_properties[5].label);
         assert_eq!(
             Cell::value(DocumentValue::Bytes(600)),
-            metadata_file_properties[4].value
+            metadata_file_properties[5].value
         );
-        assert_eq!("Metadata overhead", metadata_file_properties[5].label);
+        assert_eq!("Metadata overhead", metadata_file_properties[6].label);
         assert_eq!(
             Cell::new(vec![
                 DocumentValue::PercentageMillis(85_714),
                 DocumentValue::Text(" of table file size".to_string())
             ]),
-            metadata_file_properties[5].value
+            metadata_file_properties[6].value
         );
     }
 

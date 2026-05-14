@@ -21,12 +21,14 @@
 //! directly; backend selection is a `berg-core` concern.
 //!
 use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_credential_types::provider::ProvideCredentials;
-use iceberg::io::StorageFactory;
+use flate2::write::GzDecoder;
+use iceberg::io::{InputFile, StorageFactory};
 use iceberg::spec::{DataContentType, ManifestContentType};
 use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
@@ -40,6 +42,9 @@ use reqwest::Client;
 use time::OffsetDateTime;
 
 use crate::{BergError, Result, spec};
+
+// Keep compressed metadata accounting memory-bounded: range-read and decode in chunks.
+const METADATA_JSON_READ_CHUNK_SIZE_BYTES: u64 = 64 * 1024;
 
 /// A fully-qualified table identifier accepted by the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,10 +115,38 @@ struct AwsVaultCredentialLoader {
     profile: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetadataJsonDecodedSize {
+    stored_file_compressed: bool,
+    decoded_size_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct CountingWriter {
+    bytes_written: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum S3CredentialSource {
     AwsProfile(String),
     AwsVault(String),
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let len = u64::try_from(buf.len())
+            .map_err(|_| io::Error::other("buffer length does not fit in u64"))?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(len)
+            .ok_or_else(|| io::Error::other("byte count overflow"))?;
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Statistics for the current Iceberg table snapshot.
@@ -149,8 +182,10 @@ pub struct CurrentTableStats {
     pub manifest_list_size_bytes: u64,
     /// Total size of manifest files referenced by the current snapshot manifest list.
     pub manifest_files_size_bytes: u64,
-    /// Size of the current table metadata JSON file.
+    /// Stored size of the current table metadata JSON file.
     pub metadata_json_size_bytes: u64,
+    /// Uncompressed size of the current table metadata JSON content.
+    pub metadata_json_uncompressed_size_bytes: u64,
 }
 
 /// Data file size statistics for the current Iceberg table snapshot.
@@ -445,12 +480,15 @@ pub async fn load_current_table_stats(
         .metadata()
         .await?
         .size;
-    let metadata_json_size_bytes = table
-        .file_io()
-        .new_input(&metadata_json_path)?
-        .metadata()
-        .await?
-        .size;
+    let metadata_json_input = table.file_io().new_input(&metadata_json_path)?;
+    let metadata_json_size_bytes = metadata_json_input.metadata().await?.size;
+    let metadata_json_compressed = is_compressed_metadata_json(&metadata_json_path);
+    let metadata_json_size = metadata_json_size(
+        &metadata_json_input,
+        metadata_json_size_bytes,
+        metadata_json_compressed,
+    )
+    .await?;
     let manifest_list = snapshot
         .load_manifest_list(table.file_io(), &table.metadata_ref())
         .await?;
@@ -459,7 +497,7 @@ pub async fn load_current_table_stats(
     let mut stats = CurrentTableStats {
         snapshot_id: snapshot.snapshot_id(),
         snapshot_updated_at,
-        metadata_json_compressed: is_compressed_metadata_json(&metadata_json_path),
+        metadata_json_compressed: metadata_json_size.stored_file_compressed,
         metadata_json_path,
         manifest_list_path,
         total_table_file_size_bytes: 0,
@@ -473,6 +511,7 @@ pub async fn load_current_table_stats(
         manifest_list_size_bytes,
         manifest_files_size_bytes,
         metadata_json_size_bytes,
+        metadata_json_uncompressed_size_bytes: metadata_json_size.decoded_size_bytes,
     };
 
     visit_live_manifest_files(
@@ -1302,14 +1341,54 @@ fn percentile(sorted_values: &[u64], numerator: usize, denominator: usize) -> u6
     u128_to_u64_saturating(interpolated / denominator)
 }
 
-fn is_compressed_metadata_json(path: &str) -> bool {
-    let lower_path = path.to_ascii_lowercase();
-    let has_gzip_extension = std::path::Path::new(&lower_path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("gz"));
+async fn metadata_json_size(
+    input_file: &InputFile,
+    stored_size_bytes: u64,
+    stored_file_compressed: bool,
+) -> Result<MetadataJsonDecodedSize> {
+    if !stored_file_compressed {
+        return Ok(MetadataJsonDecodedSize {
+            stored_file_compressed,
+            decoded_size_bytes: stored_size_bytes,
+        });
+    }
 
-    has_gzip_extension || lower_path.contains(".gz.")
+    let reader = input_file.reader().await?;
+    let mut decoder = GzDecoder::new(CountingWriter::default());
+
+    let mut chunk_start = 0;
+    while chunk_start < stored_size_bytes {
+        let chunk_end = chunk_start
+            .saturating_add(METADATA_JSON_READ_CHUNK_SIZE_BYTES)
+            .min(stored_size_bytes);
+        let chunk = reader.read(chunk_start..chunk_end).await?;
+        write_gzip_chunk(&mut decoder, &chunk)?;
+        chunk_start = chunk_end;
+    }
+
+    Ok(MetadataJsonDecodedSize {
+        stored_file_compressed,
+        decoded_size_bytes: finish_gzip_uncompressed_size(decoder)?,
+    })
+}
+
+fn write_gzip_chunk(decoder: &mut GzDecoder<CountingWriter>, chunk: &[u8]) -> Result<()> {
+    decoder.write_all(chunk).map_err(iceberg::Error::from)?;
+
+    Ok(())
+}
+
+fn finish_gzip_uncompressed_size(decoder: GzDecoder<CountingWriter>) -> Result<u64> {
+    Ok(decoder
+        .finish()
+        .map_err(iceberg::Error::from)?
+        .bytes_written)
+}
+
+fn is_compressed_metadata_json(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+
+    path.ends_with(".gz.metadata.json") || path.ends_with(".metadata.json.gz")
 }
 
 async fn load_table(config: &RestCatalogConfig, table_ident: &TableIdent) -> Result<Table> {
@@ -1456,7 +1535,12 @@ pub fn parse_catalog_property(value: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::io::Write;
     use std::sync::Arc;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use iceberg::io::FileIO;
 
     use crate::spec::{
         FieldSummary, Literal, ManifestContentType, ManifestFile, NestedField, PartitionSpec,
@@ -1468,9 +1552,9 @@ mod tests {
         COLUMN_METADATA_NULL_VALUE_COUNTS, COLUMN_METADATA_VALUE_COUNTS, ColumnMetadataAccumulator,
         DataFileSizeDistribution, PartitionAccumulator, QualifiedTableIdent, RestCatalogConfig,
         credential_from_env_output, data_file_size_buckets, data_file_size_distribution,
-        find_manifest_file_by_id, manifest_file_list_entries, manifest_partition_metadata,
-        parse_catalog_property, partition_path, partition_stats_from_accumulators, rounded_average,
-        schema_field_paths,
+        find_manifest_file_by_id, is_compressed_metadata_json, manifest_file_list_entries,
+        manifest_partition_metadata, metadata_json_size, parse_catalog_property, partition_path,
+        partition_stats_from_accumulators, rounded_average, schema_field_paths,
     };
 
     #[test]
@@ -1594,6 +1678,73 @@ AWS_SESSION_TOKEN='token'
         assert_eq!("> 200% target", buckets[6].label);
         assert_eq!(1, buckets[6].file_count);
         assert_eq!(1100 * mib, buckets[6].total_size_bytes);
+    }
+
+    #[tokio::test]
+    async fn computes_metadata_json_uncompressed_size_from_stream() {
+        let metadata = br#"{"format-version":2}"#;
+        let metadata_len = u64::try_from(metadata.len()).expect("metadata length fits in u64");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(metadata).expect("write gzip metadata");
+        let compressed = encoder.finish().expect("finish gzip metadata");
+        let file_io = FileIO::new_with_memory();
+        let plain_path = "memory://table/metadata/00001.metadata.json";
+        let compressed_path = "memory://table/metadata/00002.gz.metadata.json";
+
+        file_io
+            .new_output(plain_path)
+            .expect("plain output file")
+            .write(metadata.to_vec().into())
+            .await
+            .expect("write plain metadata");
+        file_io
+            .new_output(compressed_path)
+            .expect("compressed output file")
+            .write(compressed.clone().into())
+            .await
+            .expect("write compressed metadata");
+
+        let plain_input = file_io.new_input(plain_path).expect("plain input file");
+        let plain_stored_size = plain_input.metadata().await.expect("plain metadata").size;
+        let plain_size = metadata_json_size(
+            &plain_input,
+            plain_stored_size,
+            is_compressed_metadata_json(plain_path),
+        )
+        .await
+        .expect("plain metadata size");
+
+        let compressed_input = file_io
+            .new_input(compressed_path)
+            .expect("compressed input file");
+        let compressed_stored_size = compressed_input
+            .metadata()
+            .await
+            .expect("compressed metadata")
+            .size;
+        let compressed_size = metadata_json_size(
+            &compressed_input,
+            compressed_stored_size,
+            is_compressed_metadata_json(compressed_path),
+        )
+        .await
+        .expect("compressed metadata size");
+
+        assert_eq!(Some(&0x1F), compressed.first());
+        assert_eq!(Some(&0x8B), compressed.get(1));
+        assert!(is_compressed_metadata_json(
+            "s3://bucket/table/metadata/00001.gz.metadata.json"
+        ));
+        assert!(is_compressed_metadata_json(
+            "s3://bucket/table/metadata/00001.metadata.json.gz"
+        ));
+        assert!(!is_compressed_metadata_json(
+            "s3://bucket/table/metadata/00001.metadata.json"
+        ));
+        assert!(!plain_size.stored_file_compressed);
+        assert_eq!(metadata_len, plain_size.decoded_size_bytes);
+        assert!(compressed_size.stored_file_compressed);
+        assert_eq!(metadata_len, compressed_size.decoded_size_bytes);
     }
 
     #[test]

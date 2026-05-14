@@ -26,6 +26,7 @@ aws-config = "1"
 aws-credential-types = "1"
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
+flate2 = "1"
 iceberg = "0.9"
 iceberg-catalog-rest = "0.9"
 iceberg-storage-opendal = "0.9"

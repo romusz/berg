@@ -762,6 +762,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
+ "flate2",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",

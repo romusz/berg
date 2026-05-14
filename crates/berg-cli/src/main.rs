@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::fmt::Write;
 
 use anyhow::{Context, anyhow};
@@ -13,7 +14,8 @@ use berg_core::view::{
     manifest_file_detail_document, manifest_file_list_document, schema_document,
     table_partitions_document, table_stats_document,
 };
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::error::ErrorKind;
+use clap::{ArgAction, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
@@ -309,7 +311,20 @@ enum DocumentFormat {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let args = env::args_os().collect::<Vec<_>>();
+    let cli = match Cli::try_parse_from(args.clone()) {
+        Ok(cli) => cli,
+        Err(err) => {
+            if should_show_incomplete_command_help(err.kind()) {
+                if let Some(help) = incomplete_command_help(&args[1..]) {
+                    print!("{help}");
+                    return Ok(());
+                }
+            }
+
+            err.exit();
+        }
+    };
     let catalog_args = cli.catalog;
 
     match cli.command {
@@ -351,6 +366,113 @@ async fn main() -> anyhow::Result<()> {
 
 fn print_command_tree() {
     print!("{}", command_tree());
+}
+
+fn should_show_incomplete_command_help(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::InvalidSubcommand | ErrorKind::MissingSubcommand
+    )
+}
+
+fn incomplete_command_help(args: &[OsString]) -> Option<String> {
+    let command = Cli::command();
+    let path = deepest_valid_subcommand_path(&command, args);
+    let mut command = Cli::command();
+    let command = command_path_mut(&mut command, &path)?;
+
+    command
+        .has_subcommands()
+        .then(|| command_help(&path))
+        .flatten()
+}
+
+fn command_help(path: &[String]) -> Option<String> {
+    let mut args = Vec::with_capacity(path.len() + 2);
+    args.push(OsString::from("berg"));
+    args.extend(path.iter().map(OsString::from));
+    args.push(OsString::from("--help"));
+
+    let err = Cli::command()
+        .try_get_matches_from(args)
+        .expect_err("help exits");
+    (err.kind() == ErrorKind::DisplayHelp).then(|| err.render().to_string())
+}
+
+fn deepest_valid_subcommand_path(command: &Command, args: &[OsString]) -> Vec<String> {
+    let root_command = command;
+    let mut command = command;
+    let mut path = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+
+        if let Some(skip_next) = option_value_to_skip(command, root_command, arg) {
+            index += 1 + usize::from(skip_next);
+            continue;
+        }
+
+        if let Some(subcommand) = command.find_subcommand(arg) {
+            path.push(subcommand.get_name().to_string());
+            command = subcommand;
+            index += 1;
+            continue;
+        }
+
+        if command.has_subcommands() {
+            break;
+        }
+
+        index += 1;
+    }
+
+    path
+}
+
+fn option_value_to_skip(command: &Command, root_command: &Command, arg: &OsString) -> Option<bool> {
+    let arg = arg.to_str()?;
+
+    if !arg.starts_with('-') || arg == "-" {
+        return None;
+    }
+
+    if arg == "--" {
+        return Some(false);
+    }
+
+    let Some(long_option) = arg.strip_prefix("--") else {
+        return Some(false);
+    };
+    let (long_option, inline_value) = long_option
+        .split_once('=')
+        .map_or((long_option, false), |(long_option, _)| (long_option, true));
+
+    Some(
+        !inline_value
+            && option_takes_value(command, long_option).or_else(|| {
+                (std::ptr::addr_eq(command, root_command))
+                    .then_some(false)
+                    .or_else(|| option_takes_value(root_command, long_option))
+            })?,
+    )
+}
+
+fn option_takes_value(command: &Command, long_option: &str) -> Option<bool> {
+    command
+        .get_arguments()
+        .find(|argument| argument.get_long() == Some(long_option))
+        .map(|argument| matches!(argument.get_action(), ArgAction::Set | ArgAction::Append))
+}
+
+fn command_path_mut<'a>(command: &'a mut Command, path: &[String]) -> Option<&'a mut Command> {
+    let mut command = command;
+
+    for name in path {
+        command = command.find_subcommand_mut(name)?;
+    }
+
+    Some(command)
 }
 
 fn command_tree() -> String {
@@ -1159,13 +1281,15 @@ fn separate_utc_offset(time: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use berg_core::view::{
         Block, Document, List, ListItem, ListKind, Property, Row, Section, Table,
     };
 
     use super::{
-        Cell, DocumentFormat, DocumentValue, command_tree, render_document,
-        render_document_markdown,
+        Cell, DocumentFormat, DocumentValue, command_tree, incomplete_command_help,
+        render_document, render_document_markdown,
     };
 
     #[test]
@@ -1328,5 +1452,70 @@ mod tests {
         assert!(tree.contains("│   │   └── current - Show the current schema"));
         assert!(tree.contains("│   └── stats - Inspect table statistics"));
         assert!(tree.contains("└── commands - Print the full command tree"));
+    }
+
+    #[test]
+    fn renders_parent_help_for_incomplete_manifest_command() {
+        let help = incomplete_command_help(&args([
+            "table",
+            "manifest",
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "--catalog-uri=https://example.test",
+        ]))
+        .expect("manifest help");
+
+        assert!(help.contains("Usage: berg table manifest [OPTIONS] <COMMAND>"));
+        assert!(help.contains("Commands:"));
+        assert!(help.contains("files  Inspect manifest files"));
+    }
+
+    #[test]
+    fn renders_parent_help_for_incomplete_manifest_files_command() {
+        let help = incomplete_command_help(&args([
+            "table",
+            "manifest",
+            "files",
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "--aws-vault-profile",
+            "sso-prod-engineering",
+        ]))
+        .expect("manifest files help");
+
+        assert!(help.contains("Usage: berg table manifest files [OPTIONS] <COMMAND>"));
+        assert!(help.contains("list     List manifest files for the current snapshot"));
+        assert!(help.contains("inspect  Inspect one manifest file from the current snapshot"));
+    }
+
+    #[test]
+    fn renders_parent_help_for_incomplete_data_files_command() {
+        let help = incomplete_command_help(&args([
+            "table",
+            "data",
+            "files",
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "--catalog-uri=https://example.test",
+        ]))
+        .expect("data files help");
+
+        assert!(help.contains("Usage: berg table data files [OPTIONS] <COMMAND>"));
+        assert!(help.contains("stats  Show data file size statistics for the current snapshot"));
+    }
+
+    #[test]
+    fn renders_parent_help_for_incomplete_table_command() {
+        let help = incomplete_command_help(&args([
+            "table",
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "--catalog-uri=https://example.test",
+        ]))
+        .expect("table help");
+
+        assert!(help.contains("Usage: berg table [OPTIONS] <COMMAND>"));
+        assert!(help.contains("data        Inspect table data"));
+        assert!(help.contains("manifest    Inspect table manifests"));
+    }
+
+    fn args<const N: usize>(values: [&str; N]) -> Vec<OsString> {
+        values.into_iter().map(OsString::from).collect()
     }
 }

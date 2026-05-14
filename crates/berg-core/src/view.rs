@@ -916,7 +916,7 @@ fn partition_stats_row(partition: &CurrentTablePartitionStats, bucket_count: usi
 }
 
 fn partition_bucket_file_count_column(label: &str) -> String {
-    format!("Files: {label}")
+    label.strip_suffix(" target").unwrap_or(label).to_string()
 }
 
 fn data_file_size_stats_header_properties(
@@ -2248,8 +2248,8 @@ mod tests {
                 Cell::text("Partition"),
                 Cell::text("Files"),
                 Cell::text("Size"),
-                Cell::text("Files: < 16 MiB"),
-                Cell::text("Files: 75-125% target"),
+                Cell::text("< 16 MiB"),
+                Cell::text("75-125%"),
             ],
             partitions_table.columns
         );

@@ -898,13 +898,7 @@ fn render_table_markdown(table: &berg_core::view::Table, markdown: &mut String) 
 
     let separators = columns
         .iter()
-        .map(|column| {
-            if is_right_aligned_markdown_table_column(table, *column) {
-                "---:"
-            } else {
-                "---"
-            }
-        })
+        .map(|column| markdown_table_column_separator(table, *column))
         .collect::<Vec<_>>();
     writeln!(markdown, "| {} |", separators.join(" | ")).expect("write to string");
 
@@ -1011,6 +1005,29 @@ fn render_binary_size_table_cell_markdown(cell: &Cell) -> String {
     }
 }
 
+fn markdown_table_column_separator(
+    table: &berg_core::view::Table,
+    column: MarkdownTableColumn,
+) -> &'static str {
+    if is_center_aligned_markdown_table_column(table, column) {
+        ":---:"
+    } else if is_right_aligned_markdown_table_column(table, column) {
+        "---:"
+    } else {
+        "---"
+    }
+}
+
+fn is_center_aligned_markdown_table_column(
+    table: &berg_core::view::Table,
+    column: MarkdownTableColumn,
+) -> bool {
+    match column {
+        MarkdownTableColumn::Source(index) => is_center_aligned_table_column(table, index),
+        MarkdownTableColumn::Bytes(_) | MarkdownTableColumn::BinarySize(_) => false,
+    }
+}
+
 fn is_right_aligned_markdown_table_column(
     table: &berg_core::view::Table,
     column: MarkdownTableColumn,
@@ -1018,6 +1035,33 @@ fn is_right_aligned_markdown_table_column(
     match column {
         MarkdownTableColumn::Source(index) => is_right_aligned_table_column(table, index),
         MarkdownTableColumn::Bytes(_) | MarkdownTableColumn::BinarySize(_) => true,
+    }
+}
+
+fn is_center_aligned_table_column(table: &berg_core::view::Table, column_index: usize) -> bool {
+    column_index >= 2 && is_manifest_column_metadata_table(table)
+}
+
+fn is_manifest_column_metadata_table(table: &berg_core::view::Table) -> bool {
+    matches!(
+        (table.columns.first(), table.columns.get(1)),
+        (Some(column), Some(field_id))
+            if text_cell_value(column) == Some("Column")
+                && text_cell_value(field_id) == Some("Field ID")
+    ) && table.columns.len() > 2
+        && !table.rows.is_empty()
+        && table.rows.iter().all(|row| {
+            row.cells
+                .iter()
+                .skip(2)
+                .all(|cell| matches!(text_cell_value(cell), Some("" | "✓")))
+        })
+}
+
+fn text_cell_value(cell: &Cell) -> Option<&str> {
+    match cell.values.as_slice() {
+        [DocumentValue::Text(value)] => Some(value),
+        _ => None,
     }
 }
 
@@ -1401,6 +1445,43 @@ mod tests {
         assert!(markdown.contains("1. Load table metadata"));
         assert!(markdown.contains("2. Derive schema view"));
         assert!(markdown.contains("   - Flatten nested fields"));
+    }
+
+    #[test]
+    fn centers_manifest_metadata_columns_in_markdown() {
+        let document = Document {
+            title: Cell::text("Manifest File"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![
+                    Cell::text("Column"),
+                    Cell::text("Field ID"),
+                    Cell::text("column_sizes"),
+                    Cell::text("value_counts"),
+                    Cell::text("null_value_counts"),
+                    Cell::text("nan_value_counts"),
+                    Cell::text("lower_bounds"),
+                    Cell::text("upper_bounds"),
+                ],
+                rows: vec![Row {
+                    cells: vec![
+                        Cell::code("org_id"),
+                        Cell::value(DocumentValue::Number(1)),
+                        Cell::text("✓"),
+                        Cell::text("✓"),
+                        Cell::text(""),
+                        Cell::text(""),
+                        Cell::text("✓"),
+                        Cell::text(""),
+                    ],
+                }],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(
+            markdown.contains("| --- | ---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+        );
     }
 
     #[test]

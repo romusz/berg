@@ -727,23 +727,68 @@ fn column_metadata_blocks(metadata: &[ManifestColumnMetadataSummary]) -> Vec<Blo
         return vec![Block::Paragraph(Cell::text("No column metadata found."))];
     }
 
+    let metadata_fields = column_metadata_table_fields(metadata);
+    let mut columns = vec![Cell::text("Column"), Cell::text("Field ID")];
+    columns.extend(metadata_fields.iter().cloned().map(Cell::text));
+
     vec![Block::Table(Table {
-        columns: vec![
-            Cell::text("Column"),
-            Cell::text("Field ID"),
-            Cell::text("Metadata"),
-        ],
-        rows: metadata.iter().map(column_metadata_row).collect(),
+        columns,
+        rows: metadata
+            .iter()
+            .map(|metadata| column_metadata_row(metadata, &metadata_fields))
+            .collect(),
     })]
 }
 
-fn column_metadata_row(metadata: &ManifestColumnMetadataSummary) -> Row {
-    Row {
-        cells: vec![
-            Cell::code(metadata.column_name.clone()),
-            Cell::value(DocumentValue::Number(i64::from(metadata.field_id))),
-            separated_code_cell(metadata.metadata_fields.clone()),
-        ],
+const DEFAULT_COLUMN_METADATA_FIELDS: [&str; 6] = [
+    "column_sizes",
+    "value_counts",
+    "null_value_counts",
+    "nan_value_counts",
+    "lower_bounds",
+    "upper_bounds",
+];
+
+fn column_metadata_table_fields(metadata: &[ManifestColumnMetadataSummary]) -> Vec<String> {
+    let mut fields = DEFAULT_COLUMN_METADATA_FIELDS
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    for summary in metadata {
+        for field in &summary.metadata_fields {
+            if !fields.iter().any(|existing| existing == field) {
+                fields.push(field.clone());
+            }
+        }
+    }
+
+    fields
+}
+
+fn column_metadata_row(metadata: &ManifestColumnMetadataSummary, fields: &[String]) -> Row {
+    let mut cells = vec![
+        Cell::code(metadata.column_name.clone()),
+        Cell::value(DocumentValue::Number(i64::from(metadata.field_id))),
+    ];
+    cells.extend(
+        fields
+            .iter()
+            .map(|field| column_metadata_presence_cell(metadata, field)),
+    );
+
+    Row { cells }
+}
+
+fn column_metadata_presence_cell(metadata: &ManifestColumnMetadataSummary, field: &str) -> Cell {
+    if metadata
+        .metadata_fields
+        .iter()
+        .any(|metadata_field| metadata_field == field)
+    {
+        Cell::text("✓")
+    } else {
+        Cell::text("")
     }
 }
 
@@ -2084,7 +2129,12 @@ mod tests {
             vec![
                 Cell::text("Column"),
                 Cell::text("Field ID"),
-                Cell::text("Metadata")
+                Cell::text("column_sizes"),
+                Cell::text("value_counts"),
+                Cell::text("null_value_counts"),
+                Cell::text("nan_value_counts"),
+                Cell::text("lower_bounds"),
+                Cell::text("upper_bounds"),
             ],
             column_metadata_table.columns
         );
@@ -2092,17 +2142,12 @@ mod tests {
             vec![
                 Cell::code("org_id"),
                 Cell::value(DocumentValue::Number(1)),
-                Cell::new(vec![
-                    DocumentValue::Code("column_sizes".to_string()),
-                    DocumentValue::Text(", ".to_string()),
-                    DocumentValue::Code("value_counts".to_string()),
-                    DocumentValue::Text(", ".to_string()),
-                    DocumentValue::Code("null_value_counts".to_string()),
-                    DocumentValue::Text(", ".to_string()),
-                    DocumentValue::Code("lower_bounds".to_string()),
-                    DocumentValue::Text(", ".to_string()),
-                    DocumentValue::Code("upper_bounds".to_string()),
-                ]),
+                Cell::text("✓"),
+                Cell::text("✓"),
+                Cell::text("✓"),
+                Cell::text(""),
+                Cell::text("✓"),
+                Cell::text("✓"),
             ],
             column_metadata_table.rows[0].cells
         );
@@ -2110,7 +2155,12 @@ mod tests {
             vec![
                 Cell::code("metadata.labels"),
                 Cell::value(DocumentValue::Number(3)),
-                Cell::new(vec![DocumentValue::Code("column_sizes".to_string())]),
+                Cell::text("✓"),
+                Cell::text(""),
+                Cell::text(""),
+                Cell::text(""),
+                Cell::text(""),
+                Cell::text(""),
             ],
             column_metadata_table.rows[1].cells
         );

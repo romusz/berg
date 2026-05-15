@@ -44,6 +44,10 @@ pub enum BergError {
     #[error("snapshot `{snapshot_id}` has invalid timestamp `{timestamp_ms}`")]
     InvalidSnapshotTimestamp { snapshot_id: i64, timestamp_ms: i64 },
 
+    /// A table metadata timestamp could not be represented.
+    #[error("table metadata has invalid last updated timestamp `{timestamp_ms}`")]
+    InvalidTableMetadataTimestamp { timestamp_ms: i64 },
+
     /// An error originating from `iceberg-rust`.
     #[error(transparent)]
     Iceberg(#[from] iceberg::Error),

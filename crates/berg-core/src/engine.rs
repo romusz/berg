@@ -188,6 +188,40 @@ pub struct CurrentTableStats {
     pub metadata_json_uncompressed_size_bytes: u64,
 }
 
+/// Properties and metadata identifiers from the current Iceberg table metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentTableProperties {
+    /// Current table metadata JSON location.
+    pub metadata_json_path: String,
+    /// Table metadata last update timestamp.
+    pub last_updated_at: OffsetDateTime,
+    /// Iceberg table format version.
+    pub format_version: spec::FormatVersion,
+    /// Table UUID.
+    pub table_uuid: String,
+    /// Table base location.
+    pub location: String,
+    /// Current snapshot ID, when the table has a current snapshot.
+    pub current_snapshot_id: Option<i64>,
+    /// Current schema ID.
+    pub current_schema_id: i32,
+    /// Default partition spec ID.
+    pub default_partition_spec_id: i32,
+    /// Default sort order ID.
+    pub default_sort_order_id: i64,
+    /// Table properties sorted by key for stable output.
+    pub properties: Vec<TablePropertyEntry>,
+}
+
+/// One table property key/value pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TablePropertyEntry {
+    /// Property key.
+    pub key: String,
+    /// Property value exactly as stored in table metadata.
+    pub value: String,
+}
+
 /// Data file size statistics for the current Iceberg table snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentDataFileSizeStats {
@@ -452,6 +486,47 @@ pub async fn load_current_schema(
     let table = load_table(config, table_ident).await?;
 
     Ok(table.metadata().current_schema().clone())
+}
+
+/// Load properties from the current table metadata through an Iceberg REST catalog.
+///
+/// # Errors
+///
+/// Returns an Iceberg-backed error when the catalog cannot be constructed,
+/// contacted, or cannot load the requested table. Returns
+/// [`BergError::InvalidTableMetadataTimestamp`] when the table metadata update
+/// timestamp cannot be represented.
+pub async fn load_current_table_properties(
+    config: &RestCatalogConfig,
+    table_ident: &TableIdent,
+) -> Result<CurrentTableProperties> {
+    let table = load_table(config, table_ident).await?;
+    let metadata = table.metadata();
+    let metadata_json_path = table.metadata_location_result()?.to_string();
+    let last_updated_at = table_metadata_updated_at(metadata.last_updated_ms())?;
+    let mut properties = metadata
+        .properties()
+        .iter()
+        .map(|(key, value)| TablePropertyEntry {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    properties.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+
+    Ok(CurrentTableProperties {
+        metadata_json_path,
+        last_updated_at,
+        format_version: metadata.format_version(),
+        table_uuid: metadata.uuid().to_string(),
+        location: metadata.location().to_string(),
+        current_snapshot_id: metadata.current_snapshot_id(),
+        current_schema_id: metadata.current_schema_id(),
+        default_partition_spec_id: metadata.default_partition_spec_id(),
+        default_sort_order_id: metadata.default_sort_order_id(),
+        properties,
+    })
 }
 
 /// Load current snapshot statistics for a table through an Iceberg REST catalog.
@@ -1167,13 +1242,20 @@ fn target_file_size_bytes(properties: &HashMap<String, String>) -> u64 {
         .unwrap_or(spec::TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT as u64)
 }
 
+fn table_metadata_updated_at(timestamp_ms: i64) -> Result<OffsetDateTime> {
+    timestamp_ms_to_utc(timestamp_ms)
+        .map_err(|()| BergError::InvalidTableMetadataTimestamp { timestamp_ms })
+}
+
 fn snapshot_updated_at(snapshot_id: i64, timestamp_ms: i64) -> Result<OffsetDateTime> {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp_ms) * 1_000_000).map_err(|_| {
-        BergError::InvalidSnapshotTimestamp {
-            snapshot_id,
-            timestamp_ms,
-        }
+    timestamp_ms_to_utc(timestamp_ms).map_err(|()| BergError::InvalidSnapshotTimestamp {
+        snapshot_id,
+        timestamp_ms,
     })
+}
+
+fn timestamp_ms_to_utc(timestamp_ms: i64) -> std::result::Result<OffsetDateTime, ()> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp_ms) * 1_000_000).map_err(|_| ())
 }
 
 fn rounded_average(values: &[u64]) -> Option<u64> {

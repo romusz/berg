@@ -36,9 +36,9 @@ use std::collections::HashSet;
 
 use crate::engine::{
     CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
-    CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableStats, DataFileSizeBucketStats,
-    DataFileSizeDistribution, ManifestColumnMetadataSummary, ManifestFileListEntry,
-    ManifestPartitionMetadataSummary,
+    CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableProperties, CurrentTableStats,
+    DataFileSizeBucketStats, DataFileSizeDistribution, ManifestColumnMetadataSummary,
+    ManifestFileListEntry, ManifestPartitionMetadataSummary, TablePropertyEntry,
 };
 use crate::spec::{ManifestFile, NestedFieldRef, PartitionSpec, Schema, Type};
 use time::OffsetDateTime;
@@ -332,6 +332,35 @@ pub fn table_stats_document(
                     stats,
                     total_metadata_size,
                 ))],
+            }),
+        ],
+    }
+}
+
+/// Build a semantic document view from current Iceberg table properties.
+#[must_use]
+pub fn table_properties_document(
+    table_ident: impl Into<String>,
+    source_endpoint: impl Into<String>,
+    retrieved_at: OffsetDateTime,
+    properties: &CurrentTableProperties,
+) -> Document {
+    let table_ident = table_ident.into();
+
+    Document {
+        title: Cell::new(vec![
+            DocumentValue::Text("Table Properties: ".to_string()),
+            DocumentValue::Code(table_ident),
+        ]),
+        blocks: vec![
+            Block::Properties(table_properties_header_properties(
+                source_endpoint.into(),
+                retrieved_at,
+                properties,
+            )),
+            Block::Section(Section {
+                title: Cell::text("Properties"),
+                blocks: table_property_blocks(&properties.properties),
             }),
         ],
     }
@@ -1142,6 +1171,97 @@ fn table_stats_header_properties(
     ]
 }
 
+fn table_properties_header_properties(
+    source_endpoint: String,
+    retrieved_at: OffsetDateTime,
+    properties: &CurrentTableProperties,
+) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Source endpoint".to_string(),
+            value: Cell::value(DocumentValue::Uri(source_endpoint)),
+        },
+        Property {
+            label: "Retrieved at".to_string(),
+            value: utc_and_local_timestamp_cell(retrieved_at),
+        },
+        Property {
+            label: "Metadata".to_string(),
+            value: Cell::value(DocumentValue::Uri(properties.metadata_json_path.clone())),
+        },
+        Property {
+            label: "Last updated at".to_string(),
+            value: utc_and_local_timestamp_cell(properties.last_updated_at),
+        },
+        Property {
+            label: "Format version".to_string(),
+            value: Cell::code(properties.format_version.to_string()),
+        },
+        Property {
+            label: "Table UUID".to_string(),
+            value: Cell::code(properties.table_uuid.clone()),
+        },
+        Property {
+            label: "Location".to_string(),
+            value: Cell::value(DocumentValue::Uri(properties.location.clone())),
+        },
+        Property {
+            label: "Current snapshot ID".to_string(),
+            value: optional_snapshot_id_cell(properties.current_snapshot_id),
+        },
+        Property {
+            label: "Current schema ID".to_string(),
+            value: Cell::value(DocumentValue::Number(i64::from(
+                properties.current_schema_id,
+            ))),
+        },
+        Property {
+            label: "Default partition spec ID".to_string(),
+            value: Cell::value(DocumentValue::Number(i64::from(
+                properties.default_partition_spec_id,
+            ))),
+        },
+        Property {
+            label: "Default sort order ID".to_string(),
+            value: Cell::value(DocumentValue::Number(properties.default_sort_order_id)),
+        },
+        Property {
+            label: "Properties".to_string(),
+            value: Cell::value(DocumentValue::Count(properties.properties.len())),
+        },
+    ]
+}
+
+fn table_property_blocks(properties: &[TablePropertyEntry]) -> Vec<Block> {
+    if properties.is_empty() {
+        return vec![Block::Paragraph(Cell::text("No table properties found."))];
+    }
+
+    let mut properties = properties.iter().collect::<Vec<_>>();
+    properties.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+
+    vec![Block::Table(Table {
+        columns: vec![Cell::text("Key"), Cell::text("Value")],
+        rows: properties.into_iter().map(table_property_row).collect(),
+    })]
+}
+
+fn table_property_row(property: &TablePropertyEntry) -> Row {
+    Row {
+        cells: vec![
+            Cell::code(property.key.clone()),
+            Cell::code(property.value.clone()),
+        ],
+    }
+}
+
+fn optional_snapshot_id_cell(snapshot_id: Option<i64>) -> Cell {
+    snapshot_id.map_or_else(
+        || Cell::code("n/a"),
+        |id| Cell::value(DocumentValue::Number(id)),
+    )
+}
+
 fn table_file_properties(stats: &CurrentTableStats) -> Vec<Property> {
     vec![
         Property {
@@ -1409,20 +1529,21 @@ mod tests {
 
     use crate::engine::{
         CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
-        CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableStats,
-        DataFileSizeBucketStats, DataFileSizeDistribution, ManifestColumnMetadataSummary,
-        ManifestFileListEntry, ManifestPartitionMetadataSummary,
+        CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableProperties,
+        CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
+        ManifestColumnMetadataSummary, ManifestFileListEntry, ManifestPartitionMetadataSummary,
+        TablePropertyEntry,
     };
     use crate::spec::{
-        ListType, ManifestContentType, ManifestFile, MapType, NestedField, NestedFieldRef,
-        PartitionSpec, PrimitiveType, Schema, StructType, Transform, Type,
+        FormatVersion, ListType, ManifestContentType, ManifestFile, MapType, NestedField,
+        NestedFieldRef, PartitionSpec, PrimitiveType, Schema, StructType, Transform, Type,
     };
     use time::OffsetDateTime;
 
     use super::{
         Block, Cell, DocumentValue, data_file_size_stats_document, manifest_file_detail_document,
         manifest_file_list_document, schema_document, table_partitions_document,
-        table_stats_document,
+        table_properties_document, table_stats_document,
     };
 
     fn nested_schema() -> Schema {
@@ -1747,6 +1868,132 @@ mod tests {
                 DocumentValue::Text(" of table file size".to_string())
             ]),
             metadata_file_properties[6].value
+        );
+    }
+
+    #[test]
+    fn builds_current_table_properties_document() {
+        let properties = CurrentTableProperties {
+            metadata_json_path: "s3://warehouse/table/metadata/00042.gz.metadata.json".to_string(),
+            last_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
+                .expect("valid timestamp"),
+            format_version: FormatVersion::V2,
+            table_uuid: "68f2b482-2a8f-4db4-8cfd-3ce78b11f1ed".to_string(),
+            location: "s3://warehouse/table".to_string(),
+            current_snapshot_id: Some(42),
+            current_schema_id: 7,
+            default_partition_spec_id: 3,
+            default_sort_order_id: 0,
+            properties: vec![
+                TablePropertyEntry {
+                    key: "write.target-file-size-bytes".to_string(),
+                    value: "536870912".to_string(),
+                },
+                TablePropertyEntry {
+                    key: "commit.retry.num-retries".to_string(),
+                    value: "10".to_string(),
+                },
+            ],
+        };
+
+        let document = table_properties_document(
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
+            &properties,
+        );
+
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Text("Table Properties: ".to_string()),
+                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+            ]),
+            document.title
+        );
+
+        let Block::Properties(header_properties) = &document.blocks[0] else {
+            panic!("first block should be properties");
+        };
+        assert_eq!("Source endpoint", header_properties[0].label);
+        assert_eq!("Metadata", header_properties[2].label);
+        assert_eq!("Last updated at", header_properties[3].label);
+        assert_eq!("Format version", header_properties[4].label);
+        assert_eq!(Cell::code("v2"), header_properties[4].value);
+        assert_eq!("Table UUID", header_properties[5].label);
+        assert_eq!("Current snapshot ID", header_properties[7].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Number(42)),
+            header_properties[7].value
+        );
+        assert_eq!("Properties", header_properties[11].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Count(2)),
+            header_properties[11].value
+        );
+
+        let Block::Section(section) = &document.blocks[1] else {
+            panic!("second block should be properties section");
+        };
+        assert_eq!(Cell::text("Properties"), section.title);
+
+        let Block::Table(table) = &section.blocks[0] else {
+            panic!("properties section should contain a table");
+        };
+        assert_eq!(vec![Cell::text("Key"), Cell::text("Value")], table.columns);
+        assert_eq!(
+            vec![Cell::code("commit.retry.num-retries"), Cell::code("10")],
+            table.rows[0].cells
+        );
+        assert_eq!(
+            vec![
+                Cell::code("write.target-file-size-bytes"),
+                Cell::code("536870912")
+            ],
+            table.rows[1].cells
+        );
+    }
+
+    #[test]
+    fn builds_current_table_properties_document_without_properties_or_snapshot() {
+        let properties = CurrentTableProperties {
+            metadata_json_path: "s3://warehouse/table/metadata/00042.gz.metadata.json".to_string(),
+            last_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
+                .expect("valid timestamp"),
+            format_version: FormatVersion::V2,
+            table_uuid: "68f2b482-2a8f-4db4-8cfd-3ce78b11f1ed".to_string(),
+            location: "s3://warehouse/table".to_string(),
+            current_snapshot_id: None,
+            current_schema_id: 7,
+            default_partition_spec_id: 3,
+            default_sort_order_id: 0,
+            properties: Vec::new(),
+        };
+
+        let document = table_properties_document(
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
+            &properties,
+        );
+
+        let Block::Properties(header_properties) = &document.blocks[0] else {
+            panic!("first block should be properties");
+        };
+        assert_eq!("Current snapshot ID", header_properties[7].label);
+        assert_eq!(Cell::code("n/a"), header_properties[7].value);
+        assert_eq!("Properties", header_properties[11].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Count(0)),
+            header_properties[11].value
+        );
+
+        let Block::Section(section) = &document.blocks[1] else {
+            panic!("second block should be properties section");
+        };
+        assert_eq!(Cell::text("Properties"), section.title);
+        assert_eq!(
+            Block::Paragraph(Cell::text("No table properties found.")),
+            section.blocks[0]
         );
     }
 

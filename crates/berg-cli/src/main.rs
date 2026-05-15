@@ -7,12 +7,13 @@ use anyhow::{Context, anyhow};
 use berg_core::engine::{
     QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats,
     load_current_manifest_file_detail, load_current_manifest_file_list, load_current_schema,
-    load_current_table_partitions, load_current_table_stats, parse_catalog_property,
+    load_current_table_partitions, load_current_table_properties, load_current_table_stats,
+    parse_catalog_property,
 };
 use berg_core::view::{
     Block, Cell, Document, DocumentValue, List, ListKind, data_file_size_stats_document,
     manifest_file_detail_document, manifest_file_list_document, schema_document,
-    table_partitions_document, table_stats_document,
+    table_partitions_document, table_properties_document, table_stats_document,
 };
 use clap::error::ErrorKind;
 use clap::{ArgAction, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -145,6 +146,8 @@ enum TableCommands {
     Manifest(TableManifestArgs),
     /// Inspect table partitions.
     Partitions(TablePartitionsArgs),
+    /// Inspect table properties.
+    Properties(TablePropertiesArgs),
     /// Inspect table schemas.
     Schema(TableSchemaArgs),
     /// Inspect table statistics.
@@ -246,6 +249,28 @@ struct CurrentTablePartitionsArgs {
 }
 
 #[derive(Debug, Args)]
+struct TablePropertiesArgs {
+    #[command(subcommand)]
+    command: TablePropertiesCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum TablePropertiesCommands {
+    /// Show properties from the current table metadata.
+    Current(CurrentTablePropertiesArgs),
+}
+
+#[derive(Debug, Args)]
+struct CurrentTablePropertiesArgs {
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
+    table: String,
+
+    #[command(flatten)]
+    output: DocumentOutputArgs,
+}
+
+#[derive(Debug, Args)]
 struct TableStatsArgs {
     #[command(subcommand)]
     command: TableStatsCommands,
@@ -315,11 +340,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = match Cli::try_parse_from(args.clone()) {
         Ok(cli) => cli,
         Err(err) => {
-            if should_show_incomplete_command_help(err.kind()) {
-                if let Some(help) = incomplete_command_help(&args[1..]) {
-                    print!("{help}");
-                    return Ok(());
-                }
+            if should_show_incomplete_command_help(err.kind())
+                && let Some(help) = incomplete_command_help(&args[1..])
+            {
+                print!("{help}");
+                return Ok(());
             }
 
             err.exit();
@@ -344,6 +369,11 @@ async fn main() -> anyhow::Result<()> {
             TableCommands::Partitions(partitions_args) => match partitions_args.command {
                 TablePartitionsCommands::Current(args) => {
                     print_current_table_partitions(args, catalog_args).await?;
+                }
+            },
+            TableCommands::Properties(properties_args) => match properties_args.command {
+                TablePropertiesCommands::Current(args) => {
+                    print_current_table_properties(args, catalog_args).await?;
                 }
             },
             TableCommands::Schema(schema_args) => match schema_args.command {
@@ -564,6 +594,33 @@ async fn print_current_table_partitions(
         config.table_endpoint(table.table()),
         OffsetDateTime::now_utc(),
         &stats,
+    );
+
+    print!("{}", render_document(&document, args.output.format)?);
+
+    Ok(())
+}
+
+async fn print_current_table_properties(
+    args: CurrentTablePropertiesArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<()> {
+    let table = QualifiedTableIdent::parse(&args.table)?;
+    let config = rest_catalog_config(catalog_args, &table)?;
+
+    let properties = load_current_table_properties(&config, table.table())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load current table properties for `{}`",
+                table.display_name()
+            )
+        })?;
+    let document = table_properties_document(
+        table.display_name(),
+        config.table_endpoint(table.table()),
+        OffsetDateTime::now_utc(),
+        &properties,
     );
 
     print!("{}", render_document(&document, args.output.format)?);
@@ -1485,6 +1542,27 @@ mod tests {
     }
 
     #[test]
+    fn renders_code_cells_in_markdown_tables() {
+        let document = Document {
+            title: Cell::text("Properties"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![Cell::text("Key"), Cell::text("Value")],
+                rows: vec![Row {
+                    cells: vec![
+                        Cell::code("write.target-file-size-bytes"),
+                        Cell::code("536870912"),
+                    ],
+                }],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(markdown.contains("| Key | Value |"));
+        assert!(markdown.contains("| `write.target-file-size-bytes` | `536870912` |"));
+    }
+
+    #[test]
     fn renders_document_as_debug_ast() {
         let document = Document {
             title: Cell::text("Schema"),
@@ -1529,6 +1607,10 @@ mod tests {
             "│   │       └── inspect - Inspect one manifest file from the current snapshot"
         ));
         assert!(tree.contains("│   ├── partitions - Inspect table partitions"));
+        assert!(tree.contains("│   ├── properties - Inspect table properties"));
+        assert!(
+            tree.contains("│   │   └── current - Show properties from the current table metadata")
+        );
         assert!(tree.contains("│   ├── schema - Inspect table schemas"));
         assert!(tree.contains("│   │   └── current - Show the current schema"));
         assert!(tree.contains("│   └── stats - Inspect table statistics"));

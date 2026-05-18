@@ -284,7 +284,7 @@ pub struct CurrentTableMax {
     pub data_files_field_absent: u64,
     /// Field-absent data files resolved with the current field initial-default.
     pub data_files_using_initial_default: u64,
-    /// Data files proven to have no relevant non-null values.
+    /// Data files proven to have only null/NaN values for the requested field.
     pub data_files_with_no_non_null_values: u64,
     /// Data files whose NaN counts report one or more NaN values.
     pub data_files_with_nan_values: u64,

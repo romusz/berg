@@ -774,7 +774,7 @@ fn table_data_max_data_file_properties(max: &CurrentTableMax) -> Vec<Property> {
             )),
         },
         Property {
-            label: "Data files with no non-null values".to_string(),
+            label: "Data files with only null/NaN column values".to_string(),
             value: Cell::value(DocumentValue::Unsigned(
                 max.data_files_with_no_non_null_values,
             )),
@@ -2726,6 +2726,8 @@ mod tests {
                 .iter()
                 .any(|label| label == "Data files without upper bound")
         );
+        let null_only_label = "Data files with only null/NaN column values";
+        assert!(labels.iter().any(|label| label == null_only_label));
         assert!(
             labels
                 .iter()

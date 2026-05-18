@@ -1247,45 +1247,45 @@ struct DeleteFileInfo {
 
 #[derive(Debug, Clone, Default)]
 struct CandidateDeleteStatus {
-    equality: EqualityCandidateStatus,
-    position: PositionCandidateStatus,
+    equality: DeleteSideStatus,
+    position: DeleteSideStatus,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum EqualityCandidateStatus {
-    #[default]
-    Unaffected,
-    MayAffect,
-    Unknown,
+#[derive(Debug, Clone, Default)]
+struct DeleteSideStatus {
+    has_effect: bool,
+    has_unknown: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum PositionCandidateStatus {
-    #[default]
-    Untouched,
-    Touched,
-    Unknown,
+impl DeleteSideStatus {
+    fn record_effect(&mut self) {
+        self.has_effect = true;
+    }
+
+    fn record_unknown(&mut self) {
+        self.has_unknown = true;
+    }
+
+    fn is_unaffected(&self) -> bool {
+        !self.has_effect && !self.has_unknown
+    }
 }
 
 impl CandidateDeleteStatus {
     fn record_equality_may_affect(&mut self) {
-        self.equality = EqualityCandidateStatus::MayAffect;
+        self.equality.record_effect();
     }
 
     fn record_equality_unknown(&mut self) {
-        if self.equality == EqualityCandidateStatus::Unaffected {
-            self.equality = EqualityCandidateStatus::Unknown;
-        }
+        self.equality.record_unknown();
     }
 
     fn record_position_touched(&mut self) {
-        self.position = PositionCandidateStatus::Touched;
+        self.position.record_effect();
     }
 
     fn record_position_unknown(&mut self) {
-        if self.position == PositionCandidateStatus::Untouched {
-            self.position = PositionCandidateStatus::Unknown;
-        }
+        self.position.record_unknown();
     }
 }
 
@@ -1550,16 +1550,34 @@ impl CurrentTableMaxAnalysis {
     }
 
     async fn analyze_delete_files(&mut self, table: &Table, delete_files: &[DeleteFileInfo]) {
-        let mut statuses = vec![CandidateDeleteStatus::default(); self.max_candidates.len()];
+        self.count_delete_file_inventory(delete_files);
 
         if self.max_candidates.is_empty() {
             return;
         }
 
+        let mut statuses = vec![CandidateDeleteStatus::default(); self.max_candidates.len()];
+
         self.analyze_equality_delete_files(delete_files, &mut statuses);
         self.analyze_position_delete_files(table, delete_files, &mut statuses)
             .await;
         self.finish_delete_impact(&statuses);
+    }
+
+    fn count_delete_file_inventory(&mut self, delete_files: &[DeleteFileInfo]) {
+        for delete_file in delete_files {
+            match delete_file.content_type {
+                DataContentType::EqualityDeletes => self.equality_delete_files += 1,
+                DataContentType::PositionDeletes => {
+                    self.position_delete_files += 1;
+                    self.record_position_delete_sequence(delete_file.sequence_number);
+                    if delete_file.referenced_data_file.is_some() {
+                        self.position_delete_files_with_referenced_data_file += 1;
+                    }
+                }
+                DataContentType::Data => {}
+            }
+        }
     }
 
     fn analyze_equality_delete_files(
@@ -1571,8 +1589,6 @@ impl CurrentTableMaxAnalysis {
             .iter()
             .filter(|delete_file| delete_file.content_type == DataContentType::EqualityDeletes)
         {
-            self.equality_delete_files += 1;
-
             for (candidate, status) in self.max_candidates.iter().zip(statuses.iter_mut()) {
                 match equality_delete_applicability(delete_file, candidate) {
                     DeleteApplicability::Applicable => status.record_equality_may_affect(),
@@ -1593,12 +1609,6 @@ impl CurrentTableMaxAnalysis {
             .iter()
             .filter(|delete_file| delete_file.content_type == DataContentType::PositionDeletes)
         {
-            self.position_delete_files += 1;
-            self.record_position_delete_sequence(delete_file.sequence_number);
-            if delete_file.referenced_data_file.is_some() {
-                self.position_delete_files_with_referenced_data_file += 1;
-            }
-
             if let Some(referenced_data_file) = &delete_file.referenced_data_file {
                 self.analyze_referenced_position_delete_file(
                     delete_file,
@@ -1760,13 +1770,13 @@ impl CurrentTableMaxAnalysis {
     fn finish_delete_impact(&mut self, statuses: &[CandidateDeleteStatus]) {
         self.max_candidate_files_with_applicable_equality_deletes = statuses
             .iter()
-            .filter(|status| status.equality == EqualityCandidateStatus::MayAffect)
+            .filter(|status| status.equality.has_effect)
             .count();
         self.max_equality_delete_impact = equality_delete_impact(statuses);
 
         self.max_candidate_files_touched_by_position_deletes = statuses
             .iter()
-            .filter(|status| status.position == PositionCandidateStatus::Touched)
+            .filter(|status| status.position.has_effect)
             .count();
         self.max_position_delete_impact = position_delete_impact(statuses);
         self.max_position_delete_analysis =
@@ -2484,24 +2494,24 @@ fn equality_delete_impact(statuses: &[CandidateDeleteStatus]) -> DeleteImpact {
 
     let unaffected = statuses
         .iter()
-        .filter(|status| status.equality == EqualityCandidateStatus::Unaffected)
+        .filter(|status| status.equality.is_unaffected())
         .count();
     let affected = statuses
         .iter()
-        .filter(|status| status.equality == EqualityCandidateStatus::MayAffect)
+        .filter(|status| status.equality.has_effect)
         .count();
     let unknown = statuses
         .iter()
-        .any(|status| status.equality == EqualityCandidateStatus::Unknown);
+        .any(|status| status.equality.has_unknown);
 
     if unaffected > 0 && affected > 0 {
         DeleteImpact::PartiallyAffected
     } else if unaffected > 0 {
         DeleteImpact::Unaffected
-    } else if affected == statuses.len() {
-        DeleteImpact::AllCandidatesPossiblyAffected
     } else if unknown {
         DeleteImpact::Unknown
+    } else if affected == statuses.len() {
+        DeleteImpact::AllCandidatesPossiblyAffected
     } else {
         DeleteImpact::Unaffected
     }
@@ -2514,24 +2524,24 @@ fn position_delete_impact(statuses: &[CandidateDeleteStatus]) -> DeleteImpact {
 
     let untouched = statuses
         .iter()
-        .filter(|status| status.position == PositionCandidateStatus::Untouched)
+        .filter(|status| status.position.is_unaffected())
         .count();
     let touched = statuses
         .iter()
-        .filter(|status| status.position == PositionCandidateStatus::Touched)
+        .filter(|status| status.position.has_effect)
         .count();
     let unknown = statuses
         .iter()
-        .any(|status| status.position == PositionCandidateStatus::Unknown);
+        .any(|status| status.position.has_unknown);
 
     if untouched > 0 && touched > 0 {
         DeleteImpact::PartiallyAffected
     } else if untouched > 0 {
         DeleteImpact::Unaffected
-    } else if touched == statuses.len() {
-        DeleteImpact::AllCandidatesTouched
     } else if unknown {
         DeleteImpact::Unknown
+    } else if touched == statuses.len() {
+        DeleteImpact::AllCandidatesTouched
     } else {
         DeleteImpact::Unaffected
     }
@@ -3549,12 +3559,12 @@ mod tests {
         CandidateFile, ColumnMetadataAccumulator, CurrentMetricsMode, CurrentTableMaxAnalysis,
         DataFileSizeDistribution, DeleteFileInfo, DeleteImpact, MaxConfidence,
         PartitionAccumulator, QualifiedTableIdent, ReadCompleteness, RestCatalogConfig,
-        TypeCompatibility,
-        credential_from_env_output, data_file_size_buckets, data_file_size_distribution,
-        find_manifest_file_by_id, is_compressed_metadata_json, manifest_file_list_entries,
-        manifest_partition_metadata, max_precision, metadata_json_size, parse_catalog_property,
-        partition_path, partition_stats_from_accumulators, resolve_current_column_path,
-        read_parquet_position_delete_file_paths, rounded_average, schema_field_paths,
+        TypeCompatibility, collect_delete_files, credential_from_env_output,
+        data_file_size_buckets, data_file_size_distribution, find_manifest_file_by_id,
+        is_compressed_metadata_json, manifest_file_list_entries, manifest_partition_metadata,
+        max_precision, metadata_json_size, parse_catalog_property, partition_path,
+        partition_stats_from_accumulators, read_parquet_position_delete_file_paths,
+        resolve_current_column_path, rounded_average, schema_field_paths,
     };
 
     #[test]
@@ -4097,6 +4107,145 @@ AWS_SESSION_TOKEN='token'
         );
     }
 
+    #[tokio::test]
+    async fn table_max_reports_delete_inventory_even_when_max_is_unavailable() {
+        let schema = long_test_schema(true, None);
+        let table = test_table(FileIO::new_with_memory());
+        let mut analysis = table_max_analysis(&schema);
+        let manifest = test_manifest(
+            schema.clone(),
+            vec![test_data_entry(
+                "s3://warehouse/table/data/no-bound.parquet",
+                1,
+                None,
+            )],
+        );
+        let delete_files = [
+            equality_delete_file(Some(1), 0, Struct::empty()),
+            position_delete_file(
+                Some(2),
+                DataFileFormat::Puffin,
+                Some("s3://warehouse/table/data/no-bound.parquet".to_string()),
+            ),
+            position_delete_file(None, DataFileFormat::Parquet, None),
+        ];
+
+        analysis.analyze_data_manifest(&manifest);
+        analysis.analyze_delete_files(&table, &delete_files).await;
+        analysis.finish();
+        let result = analysis.into_result();
+
+        assert_eq!(None, result.metadata_max);
+        assert_eq!(MaxConfidence::Unavailable, result.max_confidence);
+        assert_eq!(1, result.data_files_without_upper_bound);
+        assert_eq!(1, result.equality_delete_files);
+        assert_eq!(2, result.position_delete_files);
+        assert_eq!(1, result.position_delete_files_with_referenced_data_file);
+        assert_eq!(Some(2), result.position_delete_sequence_number_min);
+        assert_eq!(Some(2), result.position_delete_sequence_number_max);
+        assert_eq!(1, result.position_delete_files_without_sequence_number);
+        assert_eq!(0, result.position_delete_files_requiring_file_path_reads);
+        assert_eq!(
+            DeleteImpact::NotApplicable,
+            result.max_equality_delete_impact
+        );
+        assert_eq!(
+            DeleteImpact::NotApplicable,
+            result.max_position_delete_impact
+        );
+    }
+
+    #[tokio::test]
+    async fn table_max_reports_delete_inventory_with_no_live_data_files() {
+        let schema = long_test_schema(true, None);
+        let table = test_table(FileIO::new_with_memory());
+        let mut analysis = table_max_analysis(&schema);
+        let delete_files = [
+            equality_delete_file(Some(1), 0, Struct::empty()),
+            position_delete_file(Some(1), DataFileFormat::Parquet, None),
+        ];
+
+        analysis.analyze_delete_files(&table, &delete_files).await;
+        analysis.finish();
+        let result = analysis.into_result();
+
+        assert_eq!(None, result.metadata_max);
+        assert_eq!(MaxConfidence::Unavailable, result.max_confidence);
+        assert_eq!(0, result.data_file_metadata_entries_scanned);
+        assert_eq!(1, result.equality_delete_files);
+        assert_eq!(1, result.position_delete_files);
+        assert_eq!(0, result.position_delete_files_requiring_file_path_reads);
+        assert_eq!(
+            DeleteImpact::NotApplicable,
+            result.max_equality_delete_impact
+        );
+        assert_eq!(
+            DeleteImpact::NotApplicable,
+            result.max_position_delete_impact
+        );
+    }
+
+    #[tokio::test]
+    async fn table_max_reports_delete_inventory_with_only_zero_record_data_files() {
+        let schema = long_test_schema(true, None);
+        let table = test_table(FileIO::new_with_memory());
+        let mut analysis = table_max_analysis(&schema);
+        let manifest = test_manifest(
+            schema.clone(),
+            vec![test_data_entry_with_record_count(
+                "s3://warehouse/table/data/zero-record.parquet",
+                1,
+                0,
+                None,
+            )],
+        );
+        let delete_files = [
+            equality_delete_file(Some(1), 0, Struct::empty()),
+            position_delete_file(Some(1), DataFileFormat::Parquet, None),
+        ];
+
+        analysis.analyze_data_manifest(&manifest);
+        analysis.analyze_delete_files(&table, &delete_files).await;
+        analysis.finish();
+        let result = analysis.into_result();
+
+        assert_eq!(None, result.metadata_max);
+        assert_eq!(MaxConfidence::Unavailable, result.max_confidence);
+        assert_eq!(1, result.zero_record_data_file_metadata_entries);
+        assert_eq!(1, result.equality_delete_files);
+        assert_eq!(1, result.position_delete_files);
+        assert_eq!(0, result.position_delete_files_requiring_file_path_reads);
+        assert_eq!(
+            DeleteImpact::NotApplicable,
+            result.max_equality_delete_impact
+        );
+        assert_eq!(
+            DeleteImpact::NotApplicable,
+            result.max_position_delete_impact
+        );
+    }
+
+    #[test]
+    fn table_max_reports_zero_record_delete_inventory_when_max_is_unavailable() {
+        let schema = long_test_schema(true, None);
+        let mut analysis = table_max_analysis(&schema);
+        let manifest = test_delete_manifest(
+            schema.clone(),
+            vec![test_delete_entry(DataContentType::PositionDeletes, 0)],
+        );
+        let mut delete_files = Vec::new();
+
+        collect_delete_files(&manifest, 0, &mut analysis, &mut delete_files);
+        analysis.finish();
+        let result = analysis.into_result();
+
+        assert!(delete_files.is_empty());
+        assert_eq!(None, result.metadata_max);
+        assert_eq!(MaxConfidence::Unavailable, result.max_confidence);
+        assert_eq!(1, result.zero_record_delete_files);
+        assert_eq!(0, result.position_delete_files);
+    }
+
     #[test]
     fn table_max_missing_upper_bound_is_partial() {
         let schema = long_test_schema(true, None);
@@ -4235,14 +4384,18 @@ AWS_SESSION_TOKEN='token'
         assert_eq!(1, result.data_files_using_initial_default);
         assert_eq!(1, result.nan_upper_bounds);
         assert_eq!(0, result.upper_bound_decode_failures);
-        assert!(result
-            .max_confidence_reasons
-            .iter()
-            .any(|reason| reason.contains("no usable upper-bound")));
-        assert!(result
-            .max_confidence_reasons
-            .iter()
-            .any(|reason| reason.contains("decoded as NaN")));
+        assert!(
+            result
+                .max_confidence_reasons
+                .iter()
+                .any(|reason| reason.contains("no usable upper-bound"))
+        );
+        assert!(
+            result
+                .max_confidence_reasons
+                .iter()
+                .any(|reason| reason.contains("decoded as NaN"))
+        );
     }
 
     #[test]
@@ -4261,8 +4414,7 @@ AWS_SESSION_TOKEN='token'
             ),
             (
                 PrimitiveType::Uuid,
-                Literal::uuid_from_str("a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8")
-                    .expect("valid uuid"),
+                Literal::uuid_from_str("a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8").expect("valid uuid"),
                 "a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8",
             ),
         ] {
@@ -4357,10 +4509,12 @@ AWS_SESSION_TOKEN='token'
         assert_eq!(MaxConfidence::Unknown, result.max_confidence);
         assert_eq!(0, result.data_files_with_nan_values);
         assert_eq!(0, result.nan_upper_bounds);
-        assert!(result
-            .max_confidence_reasons
-            .iter()
-            .any(|reason| reason.contains("NaN count")));
+        assert!(
+            result
+                .max_confidence_reasons
+                .iter()
+                .any(|reason| reason.contains("NaN count"))
+        );
     }
 
     #[test]
@@ -4492,6 +4646,127 @@ AWS_SESSION_TOKEN='token'
         assert_eq!(MaxConfidence::Unknown, result.max_confidence);
     }
 
+    #[test]
+    fn table_max_equality_delete_unknown_applicability_is_not_overwritten_by_later_affect() {
+        let schema = long_test_schema(true, None);
+        let unknown_delete = equality_delete_file(Some(2), 1, Struct::empty());
+        let applicable_delete = equality_delete_file(Some(2), 0, Struct::empty());
+
+        for (case, delete_files) in [
+            (
+                "unknown before applicable",
+                vec![unknown_delete.clone(), applicable_delete.clone()],
+            ),
+            (
+                "unknown after applicable",
+                vec![applicable_delete, unknown_delete],
+            ),
+        ] {
+            let mut analysis = table_max_analysis_with_single_candidate(&schema);
+            let mut statuses =
+                vec![CandidateDeleteStatus::default(); analysis.max_candidates.len()];
+
+            analysis.analyze_equality_delete_files(&delete_files, &mut statuses);
+            analysis.finish_delete_impact(&statuses);
+            analysis.finish();
+            let result = analysis.into_result();
+
+            assert_eq!(
+                1, result.max_candidate_files_with_applicable_equality_deletes,
+                "{case}"
+            );
+            assert_eq!(
+                DeleteImpact::Unknown,
+                result.max_equality_delete_impact,
+                "{case}"
+            );
+            assert_eq!(MaxConfidence::Unknown, result.max_confidence, "{case}");
+        }
+    }
+
+    #[test]
+    fn table_max_equality_delete_unknown_missing_sequence_is_not_overwritten_by_later_affect() {
+        let schema = long_test_schema(true, None);
+        let unknown_delete = equality_delete_file(None, 0, Struct::empty());
+        let applicable_delete = equality_delete_file(Some(2), 0, Struct::empty());
+
+        for (case, delete_files) in [
+            (
+                "unknown sequence before applicable",
+                vec![unknown_delete.clone(), applicable_delete.clone()],
+            ),
+            (
+                "unknown sequence after applicable",
+                vec![applicable_delete, unknown_delete],
+            ),
+        ] {
+            let mut analysis = table_max_analysis_with_single_candidate(&schema);
+            let mut statuses =
+                vec![CandidateDeleteStatus::default(); analysis.max_candidates.len()];
+
+            analysis.analyze_equality_delete_files(&delete_files, &mut statuses);
+            analysis.finish_delete_impact(&statuses);
+            analysis.finish();
+            let result = analysis.into_result();
+
+            assert_eq!(
+                1, result.max_candidate_files_with_applicable_equality_deletes,
+                "{case}"
+            );
+            assert_eq!(
+                DeleteImpact::Unknown,
+                result.max_equality_delete_impact,
+                "{case}"
+            );
+            assert_eq!(MaxConfidence::Unknown, result.max_confidence, "{case}");
+        }
+    }
+
+    #[test]
+    fn table_max_equality_delete_one_unaffected_candidate_prevents_unknown_or_lowered_confidence() {
+        let schema = long_test_schema(true, None);
+        let unknown_delete = equality_delete_file(Some(2), 0, Struct::empty());
+        let applicable_delete = equality_delete_file(Some(2), 7, partition_value(1));
+
+        let cases = [
+            ("one unknown, one unaffected", vec![unknown_delete], None),
+            (
+                "one affected, one unaffected",
+                vec![applicable_delete],
+                Some(1),
+            ),
+        ];
+
+        for (case, delete_files, candidate_sequence) in cases {
+            let mut analysis = table_max_analysis_with_two_candidates(&schema);
+            analysis.max_candidates[0].sequence_number = candidate_sequence;
+            analysis.max_candidates[0].partition_spec_id = 7;
+            analysis.max_candidates[0].partition = partition_value(1);
+            analysis.max_candidates[1].sequence_number = Some(3);
+            analysis.max_candidates[1].partition_spec_id = 7;
+            analysis.max_candidates[1].partition = partition_value(2);
+            let mut statuses =
+                vec![CandidateDeleteStatus::default(); analysis.max_candidates.len()];
+
+            analysis.analyze_equality_delete_files(&delete_files, &mut statuses);
+            analysis.finish_delete_impact(&statuses);
+            analysis.finish();
+            let result = analysis.into_result();
+
+            assert_ne!(
+                DeleteImpact::Unknown,
+                result.max_equality_delete_impact,
+                "{case}"
+            );
+            assert_ne!(
+                DeleteImpact::AllCandidatesPossiblyAffected,
+                result.max_equality_delete_impact,
+                "{case}"
+            );
+            assert_eq!(MaxConfidence::High, result.max_confidence, "{case}");
+        }
+    }
+
     #[tokio::test]
     async fn table_max_referenced_position_delete_touch_lowers_without_file_path_read() {
         let schema = long_test_schema(true, None);
@@ -4514,6 +4789,140 @@ AWS_SESSION_TOKEN='token'
             result.max_position_delete_impact
         );
         assert_eq!(MaxConfidence::Lowered, result.max_confidence);
+    }
+
+    #[tokio::test]
+    async fn table_max_position_delete_unknown_applicability_is_not_overwritten_by_later_touch() {
+        let schema = long_test_schema(true, None);
+        let table = test_table(FileIO::new_with_memory());
+        let unknown_delete = position_delete_file(None, DataFileFormat::Parquet, None);
+        let touching_delete = position_delete_file(
+            Some(1),
+            DataFileFormat::Puffin,
+            Some("s3://warehouse/table/data/max.parquet".to_string()),
+        );
+
+        for (case, delete_files) in [
+            (
+                "unknown before touch",
+                vec![unknown_delete.clone(), touching_delete.clone()],
+            ),
+            ("unknown after touch", vec![touching_delete, unknown_delete]),
+        ] {
+            let mut analysis = table_max_analysis_with_single_candidate(&schema);
+
+            analysis.analyze_delete_files(&table, &delete_files).await;
+            analysis.finish();
+            let result = analysis.into_result();
+
+            assert_eq!(
+                1, result.position_delete_files_with_unknown_applicability,
+                "{case}"
+            );
+            assert_eq!(
+                1, result.max_candidate_files_touched_by_position_deletes,
+                "{case}"
+            );
+            assert_eq!(
+                DeleteImpact::Unknown,
+                result.max_position_delete_impact,
+                "{case}"
+            );
+            assert_eq!(MaxConfidence::Unknown, result.max_confidence, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn table_max_unreadable_position_delete_unknown_is_not_overwritten_by_later_touch() {
+        let schema = long_test_schema(true, None);
+        let table = test_table(FileIO::new_with_memory());
+        let unreadable_delete = position_delete_file(Some(1), DataFileFormat::Parquet, None)
+            .with_path("memory://delete/missing-before-touch.parquet");
+        let touching_delete = position_delete_file(
+            Some(1),
+            DataFileFormat::Puffin,
+            Some("s3://warehouse/table/data/max.parquet".to_string()),
+        );
+        let mut analysis = table_max_analysis_with_single_candidate(&schema);
+
+        analysis
+            .analyze_delete_files(&table, &[unreadable_delete, touching_delete])
+            .await;
+        analysis.finish();
+        let result = analysis.into_result();
+
+        assert_eq!(1, result.position_delete_files_requiring_file_path_reads);
+        assert_eq!(0, result.position_delete_files_read_for_file_path);
+        assert_eq!(ReadCompleteness::Incomplete, result.read_completeness);
+        assert_eq!(1, result.max_candidate_files_touched_by_position_deletes);
+        assert_eq!(DeleteImpact::Unknown, result.max_position_delete_impact);
+        assert_eq!(MaxConfidence::Unknown, result.max_confidence);
+    }
+
+    #[tokio::test]
+    async fn table_max_unsupported_position_delete_unknown_is_not_overwritten_by_later_touch() {
+        let schema = long_test_schema(true, None);
+        let table = test_table(FileIO::new_with_memory());
+        let unsupported_delete = position_delete_file(Some(1), DataFileFormat::Orc, None);
+        let touching_delete = position_delete_file(
+            Some(1),
+            DataFileFormat::Puffin,
+            Some("s3://warehouse/table/data/max.parquet".to_string()),
+        );
+        let mut analysis = table_max_analysis_with_single_candidate(&schema);
+
+        analysis
+            .analyze_delete_files(&table, &[unsupported_delete, touching_delete])
+            .await;
+        analysis.finish();
+        let result = analysis.into_result();
+
+        assert_eq!(1, result.unsupported_position_delete_files);
+        assert_eq!(1, result.max_candidate_files_touched_by_position_deletes);
+        assert_eq!(DeleteImpact::Unknown, result.max_position_delete_impact);
+        assert_eq!(MaxConfidence::Unknown, result.max_confidence);
+    }
+
+    #[tokio::test]
+    async fn table_max_position_delete_one_untouched_candidate_prevents_unknown_or_lowered_confidence()
+     {
+        let schema = long_test_schema(true, None);
+        let table = test_table(FileIO::new_with_memory());
+        let unknown_delete = position_delete_file(Some(2), DataFileFormat::Parquet, None);
+        let touching_delete = position_delete_file(
+            Some(2),
+            DataFileFormat::Puffin,
+            Some("s3://warehouse/table/data/first.parquet".to_string()),
+        );
+        let cases = [
+            ("one unknown, one untouched", vec![unknown_delete], None),
+            ("one touched, one untouched", vec![touching_delete], Some(1)),
+        ];
+
+        for (case, delete_files, candidate_sequence) in cases {
+            let mut analysis = table_max_analysis_with_two_candidates(&schema);
+            analysis.max_candidates[0].path = "s3://warehouse/table/data/first.parquet".to_string();
+            analysis.max_candidates[0].sequence_number = candidate_sequence;
+            analysis.max_candidates[1].path =
+                "s3://warehouse/table/data/second.parquet".to_string();
+            analysis.max_candidates[1].sequence_number = Some(3);
+
+            analysis.analyze_delete_files(&table, &delete_files).await;
+            analysis.finish();
+            let result = analysis.into_result();
+
+            assert_ne!(
+                DeleteImpact::Unknown,
+                result.max_position_delete_impact,
+                "{case}"
+            );
+            assert_ne!(
+                DeleteImpact::AllCandidatesTouched,
+                result.max_position_delete_impact,
+                "{case}"
+            );
+            assert_eq!(MaxConfidence::High, result.max_confidence, "{case}");
+        }
     }
 
     #[tokio::test]
@@ -4778,6 +5187,27 @@ AWS_SESSION_TOKEN='token'
         analysis
     }
 
+    fn table_max_analysis_with_two_candidates(schema: &Arc<Schema>) -> CurrentTableMaxAnalysis {
+        let mut analysis = table_max_analysis(schema);
+        let manifest = test_manifest(
+            schema.clone(),
+            vec![
+                test_data_entry(
+                    "s3://warehouse/table/data/first.parquet",
+                    1,
+                    Some(Datum::long(10)),
+                ),
+                test_data_entry(
+                    "s3://warehouse/table/data/second.parquet",
+                    1,
+                    Some(Datum::long(10)),
+                ),
+            ],
+        );
+        analysis.analyze_data_manifest(&manifest);
+        analysis
+    }
+
     fn test_manifest(schema: Arc<Schema>, entries: Vec<ManifestEntry>) -> Manifest {
         Manifest::new(
             ManifestMetadata {
@@ -4793,9 +5223,33 @@ AWS_SESSION_TOKEN='token'
         )
     }
 
+    fn test_delete_manifest(schema: Arc<Schema>, entries: Vec<ManifestEntry>) -> Manifest {
+        Manifest::new(
+            ManifestMetadata {
+                schema_id: 0,
+                schema: schema.clone(),
+                partition_spec: PartitionSpec::builder(schema)
+                    .build()
+                    .expect("valid partition spec"),
+                format_version: FormatVersion::V2,
+                content: ManifestContentType::Deletes,
+            },
+            entries,
+        )
+    }
+
     fn test_data_entry(
         path: &str,
         sequence_number: i64,
+        upper_bound: Option<Datum>,
+    ) -> ManifestEntry {
+        test_data_entry_with_record_count(path, sequence_number, 1, upper_bound)
+    }
+
+    fn test_data_entry_with_record_count(
+        path: &str,
+        sequence_number: i64,
+        record_count: u64,
         upper_bound: Option<Datum>,
     ) -> ManifestEntry {
         let upper_bounds =
@@ -4809,7 +5263,7 @@ AWS_SESSION_TOKEN='token'
                     .content(DataContentType::Data)
                     .file_path(path.to_string())
                     .file_format(DataFileFormat::Parquet)
-                    .record_count(1)
+                    .record_count(record_count)
                     .file_size_in_bytes(100)
                     .value_counts(HashMap::from([(1, 1)]))
                     .null_value_counts(HashMap::from([(1, 0)]))
@@ -4818,6 +5272,27 @@ AWS_SESSION_TOKEN='token'
                     .expect("valid data file"),
             )
             .build()
+    }
+
+    fn test_delete_entry(content_type: DataContentType, record_count: u64) -> ManifestEntry {
+        ManifestEntry::builder()
+            .status(ManifestStatus::Added)
+            .sequence_number(2)
+            .data_file(
+                DataFileBuilder::default()
+                    .content(content_type)
+                    .file_path("s3://warehouse/table/delete/zero-record.parquet".to_string())
+                    .file_format(DataFileFormat::Parquet)
+                    .record_count(record_count)
+                    .file_size_in_bytes(100)
+                    .build()
+                    .expect("valid delete file"),
+            )
+            .build()
+    }
+
+    fn partition_value(value: i64) -> Struct {
+        Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Long(value)))])
     }
 
     fn finish_without_deletes(analysis: &mut CurrentTableMaxAnalysis) {
@@ -4871,9 +5346,12 @@ AWS_SESSION_TOKEN='token'
 
     fn test_table(file_io: FileIO) -> Table {
         let schema = Schema::builder()
-            .with_fields([
-                NestedField::required(1, "event_id", Type::Primitive(PrimitiveType::Long)).into(),
-            ])
+            .with_fields([NestedField::required(
+                1,
+                "event_id",
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
             .build()
             .expect("valid schema");
         let metadata = TableMetadataBuilder::new(

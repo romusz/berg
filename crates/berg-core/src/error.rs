@@ -40,6 +40,10 @@ pub enum BergError {
     #[error("manifest file id `{id}` not found; available ids: {}", available.join(", "))]
     UnknownManifestFileId { id: String, available: Vec<String> },
 
+    /// A requested column path was not present in the current schema.
+    #[error("unknown column path `{path}` in current schema")]
+    UnknownColumnPath { path: String },
+
     /// A snapshot timestamp could not be represented.
     #[error("snapshot `{snapshot_id}` has invalid timestamp `{timestamp_ms}`")]
     InvalidSnapshotTimestamp { snapshot_id: i64, timestamp_ms: i64 },

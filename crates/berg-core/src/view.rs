@@ -35,10 +35,12 @@ use std::borrow::Borrow;
 use std::collections::HashSet;
 
 use crate::engine::{
-    CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
-    CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableProperties, CurrentTableStats,
-    DataFileSizeBucketStats, DataFileSizeDistribution, ManifestColumnMetadataSummary,
-    ManifestFileListEntry, ManifestPartitionMetadataSummary, TablePropertyEntry,
+    BoundPrecision, CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
+    CurrentTableMax, CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableProperties,
+    CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
+    DeleteAnalysisCompleteness, DeleteImpact, ManifestColumnMetadataSummary, ManifestFileListEntry,
+    ManifestPartitionMetadataSummary, MaxConfidence, ReadCompleteness, TablePropertyEntry,
+    TypeCompatibility,
 };
 use crate::spec::{ManifestFile, NestedFieldRef, PartitionSpec, Schema, Type};
 use time::OffsetDateTime;
@@ -407,6 +409,81 @@ pub fn data_file_size_stats_document(
     }
 }
 
+/// Build a semantic document view from a metadata-derived current snapshot max result.
+#[must_use]
+pub fn table_data_max_document(
+    table_ident: impl Into<String>,
+    source_endpoint: impl Into<String>,
+    retrieved_at: OffsetDateTime,
+    max: &CurrentTableMax,
+) -> Document {
+    let table_ident = table_ident.into();
+    let mut blocks = if max.unsupported_reason.is_some() {
+        vec![Block::Properties(table_data_max_unsupported_properties(
+            max,
+        ))]
+    } else {
+        vec![table_data_max_result_block(max)]
+    };
+
+    blocks.extend([
+        Block::Section(Section {
+            title: Cell::text("Scope"),
+            blocks: vec![Block::Properties(table_data_max_scope_properties(
+                source_endpoint.into(),
+                retrieved_at,
+                max,
+            ))],
+        }),
+        Block::Section(Section {
+            title: Cell::text("Data File Metadata"),
+            blocks: vec![Block::Properties(table_data_max_data_file_properties(max))],
+        }),
+        Block::Section(Section {
+            title: Cell::text("Equality Deletes"),
+            blocks: vec![Block::Properties(
+                table_data_max_equality_delete_properties(max),
+            )],
+        }),
+        Block::Section(Section {
+            title: Cell::text("Position Deletes"),
+            blocks: vec![Block::Properties(
+                table_data_max_position_delete_properties(max),
+            )],
+        }),
+        Block::Section(Section {
+            title: Cell::text("Completeness And Precision"),
+            blocks: vec![Block::Properties(table_data_max_completeness_properties(
+                max,
+            ))],
+        }),
+    ]);
+
+    if !max.caveats.is_empty() {
+        blocks.push(Block::Section(Section {
+            title: Cell::text("Caveats"),
+            blocks: vec![Block::List(List {
+                kind: ListKind::Unordered,
+                items: max
+                    .caveats
+                    .iter()
+                    .map(|caveat| ListItem {
+                        blocks: vec![Block::Paragraph(Cell::text(caveat.clone()))],
+                    })
+                    .collect(),
+            })],
+        }));
+    }
+
+    Document {
+        title: Cell::new(vec![
+            DocumentValue::Text("Table Data Max: ".to_string()),
+            DocumentValue::Code(table_ident),
+        ]),
+        blocks,
+    }
+}
+
 /// Build a semantic document view from current snapshot manifest files.
 #[must_use]
 pub fn manifest_file_list_document(
@@ -553,6 +630,423 @@ fn manifest_file_list_header_properties(
             value: Cell::value(DocumentValue::Count(manifest_files.files.len())),
         },
     ]
+}
+
+fn table_data_max_result_block(max: &CurrentTableMax) -> Block {
+    Block::List(List {
+        kind: ListKind::Unordered,
+        items: vec![
+            ListItem {
+                blocks: vec![Block::Paragraph(label_value_cell(
+                    "Metadata max",
+                    max.metadata_max
+                        .as_ref()
+                        .map_or_else(|| Cell::code("unavailable"), Cell::code),
+                ))],
+            },
+            ListItem {
+                blocks: vec![Block::Paragraph(label_value_cell(
+                    "Max confidence",
+                    Cell::code(max_confidence_label(max.max_confidence)),
+                ))],
+            },
+            ListItem {
+                blocks: vec![Block::Paragraph(label_value_cell(
+                    "Max precision",
+                    Cell::code(bound_precision_label(max.max_precision)),
+                ))],
+            },
+            ListItem {
+                blocks: vec![
+                    Block::Paragraph(Cell::text("Max confidence reasons:")),
+                    Block::List(List {
+                        kind: ListKind::Unordered,
+                        items: max
+                            .max_confidence_reasons
+                            .iter()
+                            .map(|reason| ListItem {
+                                blocks: vec![Block::Paragraph(Cell::text(reason.clone()))],
+                            })
+                            .collect(),
+                    }),
+                ],
+            },
+        ],
+    })
+}
+
+fn label_value_cell(label: &str, value: Cell) -> Cell {
+    let mut values = vec![DocumentValue::Text(format!("{label}: "))];
+    values.extend(value.values);
+    Cell::new(values)
+}
+
+fn table_data_max_unsupported_properties(max: &CurrentTableMax) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Result".to_string(),
+            value: Cell::code("unsupported"),
+        },
+        Property {
+            label: "Reason".to_string(),
+            value: Cell::text(max.unsupported_reason.clone().unwrap_or_default()),
+        },
+    ]
+}
+
+fn table_data_max_scope_properties(
+    source_endpoint: String,
+    retrieved_at: OffsetDateTime,
+    max: &CurrentTableMax,
+) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Source endpoint".to_string(),
+            value: Cell::value(DocumentValue::Uri(source_endpoint)),
+        },
+        Property {
+            label: "Retrieved at".to_string(),
+            value: utc_and_local_timestamp_cell(retrieved_at),
+        },
+        Property {
+            label: "Snapshot ID".to_string(),
+            value: Cell::value(DocumentValue::Number(max.snapshot_id)),
+        },
+        Property {
+            label: "Snapshot updated at".to_string(),
+            value: utc_and_local_timestamp_cell(max.snapshot_updated_at),
+        },
+        Property {
+            label: "Manifest list".to_string(),
+            value: Cell::value(DocumentValue::Uri(max.manifest_list_path.clone())),
+        },
+        Property {
+            label: "Result scope".to_string(),
+            value: Cell::text(
+                "metadata-derived current snapshot max; table data files were not scanned",
+            ),
+        },
+        Property {
+            label: "Column".to_string(),
+            value: Cell::code(max.column.clone()),
+        },
+        Property {
+            label: "Field path".to_string(),
+            value: Cell::code(max.field_path.clone()),
+        },
+        Property {
+            label: "Field ID".to_string(),
+            value: Cell::value(DocumentValue::Number(i64::from(max.field_id))),
+        },
+        Property {
+            label: "Field type".to_string(),
+            value: Cell::code(max.field_type.clone()),
+        },
+        Property {
+            label: "Schema scope".to_string(),
+            value: Cell::text("current schema"),
+        },
+    ]
+}
+
+fn table_data_max_data_file_properties(max: &CurrentTableMax) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Data file metadata entries scanned".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.data_file_metadata_entries_scanned,
+            )),
+        },
+        Property {
+            label: "Zero-record data file metadata entries".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.zero_record_data_file_metadata_entries,
+            )),
+        },
+        Property {
+            label: "Data files where field is absent from file schema".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(max.data_files_field_absent)),
+        },
+        Property {
+            label: "Data files using initial-default".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.data_files_using_initial_default,
+            )),
+        },
+        Property {
+            label: "Data files with no non-null values".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.data_files_with_no_non_null_values,
+            )),
+        },
+        Property {
+            label: "Data files with NaN values".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(max.data_files_with_nan_values)),
+        },
+        Property {
+            label: "Data files without upper bound".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(max.data_files_without_upper_bound)),
+        },
+        Property {
+            label: "NaN upper bounds".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(max.nan_upper_bounds)),
+        },
+        Property {
+            label: "Upper-bound decode failures".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(max.upper_bound_decode_failures)),
+        },
+        Property {
+            label: "Manifest decode failures".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(max.manifest_decode_failures)),
+        },
+    ]
+}
+
+fn table_data_max_equality_delete_properties(max: &CurrentTableMax) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Equality delete files".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(max.equality_delete_files)),
+        },
+        Property {
+            label: "Zero-record delete files".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(max.zero_record_delete_files)),
+        },
+        Property {
+            label: "Max candidate files with applicable equality deletes".to_string(),
+            value: ratio_count_cell(
+                max.max_candidate_files_with_applicable_equality_deletes,
+                max.max_candidate_file_count,
+            ),
+        },
+        Property {
+            label: "Max equality-delete impact".to_string(),
+            value: Cell::code(delete_impact_label(max.max_equality_delete_impact)),
+        },
+    ]
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "position delete diagnostics intentionally stay together"
+)]
+fn table_data_max_position_delete_properties(max: &CurrentTableMax) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Position delete files".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(max.position_delete_files)),
+        },
+        Property {
+            label: "Max candidate data sequence number range".to_string(),
+            value: optional_i64_range_cell(
+                max.max_candidate_data_sequence_number_min,
+                max.max_candidate_data_sequence_number_max,
+            ),
+        },
+        Property {
+            label: "Max candidate files without sequence number".to_string(),
+            value: Cell::value(DocumentValue::Count(
+                max.max_candidate_files_without_sequence_number,
+            )),
+        },
+        Property {
+            label: "Position delete sequence number range".to_string(),
+            value: optional_i64_range_cell(
+                max.position_delete_sequence_number_min,
+                max.position_delete_sequence_number_max,
+            ),
+        },
+        Property {
+            label: "Position delete files without sequence number".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.position_delete_files_without_sequence_number,
+            )),
+        },
+        Property {
+            label: "Position delete files with referenced_data_file".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.position_delete_files_with_referenced_data_file,
+            )),
+        },
+        Property {
+            label: "Position delete files not applicable by sequence number".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.position_delete_files_not_applicable_by_sequence,
+            )),
+        },
+        Property {
+            label: "Position delete files not applicable by partition".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.position_delete_files_not_applicable_by_partition,
+            )),
+        },
+        Property {
+            label: "Position delete files not applicable by referenced_data_file".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.position_delete_files_not_applicable_by_referenced_data_file,
+            )),
+        },
+        Property {
+            label: "Position delete files with unknown max-candidate applicability".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.position_delete_files_with_unknown_applicability,
+            )),
+        },
+        Property {
+            label: "Position delete files applicable to max candidates".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.position_delete_files_applicable_to_max_candidates,
+            )),
+        },
+        Property {
+            label: "Position delete files requiring file_path reads".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.position_delete_files_requiring_file_path_reads,
+            )),
+        },
+        Property {
+            label: "Position delete files read for file_path".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.position_delete_files_read_for_file_path,
+            )),
+        },
+        Property {
+            label: "Unsupported position delete files".to_string(),
+            value: Cell::value(DocumentValue::Unsigned(
+                max.unsupported_position_delete_files,
+            )),
+        },
+        Property {
+            label: "Max candidate files touched by position deletes".to_string(),
+            value: ratio_count_cell(
+                max.max_candidate_files_touched_by_position_deletes,
+                max.max_candidate_file_count,
+            ),
+        },
+        Property {
+            label: "Max position-delete impact".to_string(),
+            value: Cell::code(delete_impact_label(max.max_position_delete_impact)),
+        },
+        Property {
+            label: "Max position-delete analysis".to_string(),
+            value: Cell::code(delete_analysis_label(max.max_position_delete_analysis)),
+        },
+    ]
+}
+
+fn table_data_max_completeness_properties(max: &CurrentTableMax) -> Vec<Property> {
+    let mut properties = vec![
+        Property {
+            label: "Read completeness".to_string(),
+            value: Cell::code(read_completeness_label(max.read_completeness)),
+        },
+        Property {
+            label: "Type compatibility".to_string(),
+            value: Cell::code(type_compatibility_label(max.type_compatibility)),
+        },
+    ];
+
+    if let Some(detail) = &max.type_compatibility_detail {
+        properties.push(Property {
+            label: "Type compatibility detail".to_string(),
+            value: Cell::text(detail.clone()),
+        });
+    }
+
+    properties.extend([
+        Property {
+            label: "Metrics mode evidence".to_string(),
+            value: Cell::text(max.metrics_mode_evidence.clone()),
+        },
+        Property {
+            label: "Current/default metrics mode for column".to_string(),
+            value: Cell::code(max.current_metrics_mode.clone()),
+        },
+    ]);
+
+    if let Some(detail) = &max.precision_detail {
+        properties.push(Property {
+            label: "Precision detail".to_string(),
+            value: Cell::text(detail.clone()),
+        });
+    }
+
+    properties
+}
+
+fn max_confidence_label(confidence: MaxConfidence) -> &'static str {
+    match confidence {
+        MaxConfidence::High => "high",
+        MaxConfidence::Partial => "partial",
+        MaxConfidence::Lowered => "lowered",
+        MaxConfidence::Unknown => "unknown",
+        MaxConfidence::Unavailable => "unavailable",
+    }
+}
+
+fn bound_precision_label(precision: BoundPrecision) -> &'static str {
+    match precision {
+        BoundPrecision::Exact => "exact",
+        BoundPrecision::ProbablyExact => "probably exact",
+        BoundPrecision::PossiblyTruncated => "possibly truncated",
+        BoundPrecision::Unknown => "unknown",
+        BoundPrecision::Unavailable => "unavailable",
+    }
+}
+
+fn delete_impact_label(impact: DeleteImpact) -> &'static str {
+    match impact {
+        DeleteImpact::Unaffected => "unaffected",
+        DeleteImpact::PartiallyAffected => "partially affected",
+        DeleteImpact::AllCandidatesPossiblyAffected => "all candidates possibly affected",
+        DeleteImpact::AllCandidatesTouched => "all candidates touched",
+        DeleteImpact::Unknown => "unknown",
+        DeleteImpact::NotApplicable => "not applicable",
+    }
+}
+
+fn delete_analysis_label(analysis: DeleteAnalysisCompleteness) -> &'static str {
+    match analysis {
+        DeleteAnalysisCompleteness::Complete => "complete",
+        DeleteAnalysisCompleteness::Incomplete => "incomplete",
+        DeleteAnalysisCompleteness::NotApplicable => "not applicable",
+    }
+}
+
+fn read_completeness_label(completeness: ReadCompleteness) -> &'static str {
+    match completeness {
+        ReadCompleteness::Complete => "complete",
+        ReadCompleteness::Incomplete => "incomplete",
+    }
+}
+
+fn type_compatibility_label(compatibility: TypeCompatibility) -> &'static str {
+    match compatibility {
+        TypeCompatibility::Exact => "exact",
+        TypeCompatibility::SafelyPromoted => "safely promoted",
+        TypeCompatibility::Incompatible => "incompatible",
+        TypeCompatibility::Unknown => "unknown",
+    }
+}
+
+fn ratio_count_cell(numerator: usize, denominator: usize) -> Cell {
+    Cell::new(vec![
+        DocumentValue::Count(numerator),
+        DocumentValue::Text(" / ".to_string()),
+        DocumentValue::Count(denominator),
+    ])
+}
+
+fn optional_i64_range_cell(min: Option<i64>, max: Option<i64>) -> Cell {
+    match (min, max) {
+        (Some(min), Some(max)) if min == max => Cell::value(DocumentValue::Number(min)),
+        (Some(min), Some(max)) => Cell::new(vec![
+            DocumentValue::Number(min),
+            DocumentValue::Text("..".to_string()),
+            DocumentValue::Number(max),
+        ]),
+        _ => Cell::code("n/a"),
+    }
 }
 
 fn manifest_file_detail_header_properties(
@@ -1528,11 +2022,12 @@ mod tests {
     use std::sync::Arc;
 
     use crate::engine::{
-        CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
-        CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableProperties,
-        CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
+        BoundPrecision, CurrentDataFileSizeStats, CurrentManifestFileDetail,
+        CurrentManifestFileList, CurrentTableMax, CurrentTablePartitionStats,
+        CurrentTablePartitions, CurrentTableProperties, CurrentTableStats, DataFileSizeBucketStats,
+        DataFileSizeDistribution, DeleteAnalysisCompleteness, DeleteImpact,
         ManifestColumnMetadataSummary, ManifestFileListEntry, ManifestPartitionMetadataSummary,
-        TablePropertyEntry,
+        MaxConfidence, ReadCompleteness, TablePropertyEntry, TypeCompatibility,
     };
     use crate::spec::{
         FormatVersion, ListType, ManifestContentType, ManifestFile, MapType, NestedField,
@@ -1542,8 +2037,8 @@ mod tests {
 
     use super::{
         Block, Cell, DocumentValue, data_file_size_stats_document, manifest_file_detail_document,
-        manifest_file_list_document, schema_document, table_partitions_document,
-        table_properties_document, table_stats_document,
+        manifest_file_list_document, schema_document, table_data_max_document,
+        table_partitions_document, table_properties_document, table_stats_document,
     };
 
     fn nested_schema() -> Schema {
@@ -2122,6 +2617,141 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "document shape assertions are intentionally explicit"
+    )]
+    fn builds_table_data_max_document_without_min_side_fields() {
+        let max = CurrentTableMax {
+            snapshot_id: 42,
+            snapshot_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
+                .expect("valid timestamp"),
+            manifest_list_path: "s3://warehouse/table/metadata/snap-42.avro".to_string(),
+            column: "event_id".to_string(),
+            field_path: "event_id".to_string(),
+            field_id: 1,
+            field_type: "long".to_string(),
+            unsupported_reason: None,
+            metadata_max: Some("999".to_string()),
+            max_confidence: MaxConfidence::High,
+            max_confidence_reasons: vec!["complete upper-bound coverage".to_string()],
+            max_precision: BoundPrecision::Exact,
+            data_file_metadata_entries_scanned: 2,
+            zero_record_data_file_metadata_entries: 0,
+            data_files_field_absent: 0,
+            data_files_using_initial_default: 0,
+            data_files_with_no_non_null_values: 0,
+            data_files_with_nan_values: 0,
+            data_files_without_upper_bound: 0,
+            nan_upper_bounds: 0,
+            upper_bound_decode_failures: 0,
+            manifest_decode_failures: 0,
+            equality_delete_files: 0,
+            zero_record_delete_files: 0,
+            max_candidate_files_with_applicable_equality_deletes: 0,
+            max_candidate_file_count: 1,
+            max_candidate_data_sequence_number_min: Some(7),
+            max_candidate_data_sequence_number_max: Some(7),
+            max_candidate_files_without_sequence_number: 0,
+            max_equality_delete_impact: DeleteImpact::Unaffected,
+            position_delete_files: 0,
+            position_delete_sequence_number_min: None,
+            position_delete_sequence_number_max: None,
+            position_delete_files_without_sequence_number: 0,
+            position_delete_files_with_referenced_data_file: 0,
+            position_delete_files_not_applicable_by_sequence: 0,
+            position_delete_files_not_applicable_by_partition: 0,
+            position_delete_files_not_applicable_by_referenced_data_file: 0,
+            position_delete_files_with_unknown_applicability: 0,
+            position_delete_files_applicable_to_max_candidates: 0,
+            position_delete_files_requiring_file_path_reads: 0,
+            position_delete_files_read_for_file_path: 0,
+            unsupported_position_delete_files: 0,
+            max_candidate_files_touched_by_position_deletes: 0,
+            max_position_delete_impact: DeleteImpact::Unaffected,
+            max_position_delete_analysis: DeleteAnalysisCompleteness::Complete,
+            read_completeness: ReadCompleteness::Complete,
+            type_compatibility: TypeCompatibility::Exact,
+            type_compatibility_detail: None,
+            metrics_mode_evidence:
+                "Iceberg default; per-file historical metrics mode is not available".to_string(),
+            current_metrics_mode: "truncate(16)".to_string(),
+            precision_detail: Some(
+                "metrics truncation does not apply to this field type".to_string(),
+            ),
+            caveats: Vec::new(),
+        };
+
+        let document = table_data_max_document(
+            "lakehouse.redapl_v3.events",
+            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/events",
+            OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
+            &max,
+        );
+
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Text("Table Data Max: ".to_string()),
+                DocumentValue::Code("lakehouse.redapl_v3.events".to_string())
+            ]),
+            document.title
+        );
+
+        let Block::List(result_items) = &document.blocks[0] else {
+            panic!("first block should contain max result items");
+        };
+        assert_eq!(4, result_items.items.len());
+        assert_eq!(
+            Block::Paragraph(Cell::new(vec![
+                DocumentValue::Text("Metadata max: ".to_string()),
+                DocumentValue::Code("999".to_string())
+            ])),
+            result_items.items[0].blocks[0]
+        );
+        assert_eq!(
+            Block::Paragraph(Cell::new(vec![
+                DocumentValue::Text("Max precision: ".to_string()),
+                DocumentValue::Code("exact".to_string())
+            ])),
+            result_items.items[2].blocks[0]
+        );
+        let Block::List(reason_items) = &result_items.items[3].blocks[1] else {
+            panic!("max confidence reasons should be nested list items");
+        };
+        assert_eq!(1, reason_items.items.len());
+
+        let labels = document_property_labels(&document);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "Data files without upper bound")
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "Max candidate data sequence number range")
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "Position delete sequence number range")
+        );
+        assert!(
+            labels.iter().any(|label| {
+                label == "Position delete files not applicable by sequence number"
+            })
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "Position delete files applicable to max candidates")
+        );
+        assert!(!labels.iter().any(|label| label.contains("Metadata min")));
+        assert!(!labels.iter().any(|label| label.contains("Min confidence")));
+        assert!(!labels.iter().any(|label| label.contains("lower bound")));
+    }
+
+    #[test]
     fn builds_manifest_file_list_document() {
         let manifest_files = CurrentManifestFileList {
             snapshot_id: 42,
@@ -2195,6 +2825,28 @@ mod tests {
             ],
             files_table.rows[0].cells
         );
+    }
+
+    fn document_property_labels(document: &super::Document) -> Vec<String> {
+        let mut labels = Vec::new();
+        collect_property_labels(&document.blocks, &mut labels);
+        labels
+    }
+
+    fn collect_property_labels(blocks: &[Block], labels: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                Block::Properties(properties) => {
+                    labels.extend(properties.iter().map(|property| property.label.clone()));
+                }
+                Block::Section(section) => collect_property_labels(&section.blocks, labels),
+                Block::Paragraph(_)
+                | Block::Table(_)
+                | Block::List(_)
+                | Block::FencedCode(_)
+                | Block::ThematicBreak => {}
+            }
+        }
     }
 
     #[test]

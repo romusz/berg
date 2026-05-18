@@ -7,13 +7,14 @@ use anyhow::{Context, anyhow};
 use berg_core::engine::{
     QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats,
     load_current_manifest_file_detail, load_current_manifest_file_list, load_current_schema,
-    load_current_table_partitions, load_current_table_properties, load_current_table_stats,
-    parse_catalog_property,
+    load_current_table_max, load_current_table_partitions, load_current_table_properties,
+    load_current_table_stats, parse_catalog_property,
 };
 use berg_core::view::{
     Block, Cell, Document, DocumentValue, List, ListKind, data_file_size_stats_document,
     manifest_file_detail_document, manifest_file_list_document, schema_document,
-    table_partitions_document, table_properties_document, table_stats_document,
+    table_data_max_document, table_partitions_document, table_properties_document,
+    table_stats_document,
 };
 use clap::error::ErrorKind;
 use clap::{ArgAction, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -186,6 +187,34 @@ struct TableDataArgs {
 enum TableDataCommands {
     /// Inspect data files.
     Files(TableDataFilesArgs),
+    /// Compute metadata-derived max values.
+    Max(TableDataMaxArgs),
+}
+
+#[derive(Debug, Args)]
+struct TableDataMaxArgs {
+    #[command(subcommand)]
+    command: TableDataMaxCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum TableDataMaxCommands {
+    /// Show metadata-derived max for a current snapshot column.
+    Current(CurrentTableDataMaxArgs),
+}
+
+#[derive(Debug, Args)]
+struct CurrentTableDataMaxArgs {
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
+    table: String,
+
+    /// Exact current-schema field path.
+    #[arg(value_name = "column-name")]
+    column: String,
+
+    #[command(flatten)]
+    output: DocumentOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -358,6 +387,11 @@ async fn main() -> anyhow::Result<()> {
                 TableDataCommands::Files(files_args) => match files_args.command {
                     TableDataFilesCommands::Stats(args) => {
                         print_data_file_size_stats(args, catalog_args).await?;
+                    }
+                },
+                TableDataCommands::Max(max_args) => match max_args.command {
+                    TableDataMaxCommands::Current(args) => {
+                        print_current_table_data_max(args, catalog_args).await?;
                     }
                 },
             },
@@ -675,6 +709,34 @@ async fn print_data_file_size_stats(
         config.table_endpoint(table.table()),
         OffsetDateTime::now_utc(),
         &stats,
+    );
+
+    print!("{}", render_document(&document, args.output.format)?);
+
+    Ok(())
+}
+
+async fn print_current_table_data_max(
+    args: CurrentTableDataMaxArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<()> {
+    let table = QualifiedTableIdent::parse(&args.table)?;
+    let config = rest_catalog_config(catalog_args, &table)?;
+
+    let max = load_current_table_max(&config, table.table(), &args.column)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load metadata-derived max for `{}` column `{}`",
+                table.display_name(),
+                args.column
+            )
+        })?;
+    let document = table_data_max_document(
+        table.display_name(),
+        config.table_endpoint(table.table()),
+        OffsetDateTime::now_utc(),
+        &max,
     );
 
     print!("{}", render_document(&document, args.output.format)?);
@@ -1594,9 +1656,11 @@ mod tests {
         assert!(tree.contains("berg - Command-line interface for Berg."));
         assert!(tree.contains("├── table - Inspect tables"));
         assert!(tree.contains("│   ├── data - Inspect table data"));
-        assert!(tree.contains("│   │   └── files - Inspect data files"));
+        assert!(tree.contains("│   │   ├── files - Inspect data files"));
+        assert!(tree.contains("stats - Show data file size statistics for the current snapshot"));
+        assert!(tree.contains("│   │   └── max - Compute metadata-derived max values"));
         assert!(tree.contains(
-            "│   │       └── stats - Show data file size statistics for the current snapshot"
+            "│   │       └── current - Show metadata-derived max for a current snapshot column"
         ));
         assert!(tree.contains("│   ├── manifest - Inspect table manifests"));
         assert!(tree.contains("│   │   └── files - Inspect manifest files"));
@@ -1662,6 +1726,22 @@ mod tests {
 
         assert!(help.contains("Usage: berg table data files [OPTIONS] <COMMAND>"));
         assert!(help.contains("stats  Show data file size statistics for the current snapshot"));
+    }
+
+    #[test]
+    fn renders_parent_help_for_incomplete_data_max_command() {
+        let help = incomplete_command_help(&args([
+            "table",
+            "data",
+            "max",
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "event_id",
+            "--catalog-uri=https://example.test",
+        ]))
+        .expect("data max help");
+
+        assert!(help.contains("Usage: berg table data max [OPTIONS] <COMMAND>"));
+        assert!(help.contains("current  Show metadata-derived max for a current snapshot column"));
     }
 
     #[test]

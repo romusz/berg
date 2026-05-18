@@ -12,6 +12,7 @@ description.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arrow-array.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
@@ -19,10 +20,14 @@ flate2.workspace = true
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-storage-opendal.workspace = true
+parquet.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+arrow-schema.workspace = true
 
 [lints]
 workspace = true

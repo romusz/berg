@@ -21,6 +21,8 @@ categories = ["command-line-utilities", "database"]
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+arrow-array = "57.3.0"
+arrow-schema = "57.3.0"
 async-trait = "0.1"
 aws-config = "1"
 aws-credential-types = "1"
@@ -30,6 +32,7 @@ flate2 = "1"
 iceberg = "0.9"
 iceberg-catalog-rest = "0.9"
 iceberg-storage-opendal = "0.9"
+parquet = { version = "57.3.0", features = ["async"] }
 ratatui = "0.30.0"
 reqwest = "0.12"
 thiserror = "2.0.18"

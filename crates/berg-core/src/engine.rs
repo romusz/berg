@@ -160,6 +160,8 @@ pub struct CurrentTableStats {
     pub snapshot_id: i64,
     /// Snapshot commit/update timestamp.
     pub snapshot_updated_at: OffsetDateTime,
+    /// Number of snapshots retained in the current table metadata.
+    pub retained_snapshot_count: usize,
     /// Current table metadata JSON location.
     pub metadata_json_path: String,
     /// Whether the current table metadata JSON object is compressed.
@@ -767,6 +769,7 @@ pub async fn load_current_table_stats(
     let mut stats = CurrentTableStats {
         snapshot_id: snapshot.snapshot_id(),
         snapshot_updated_at,
+        retained_snapshot_count: metadata.snapshots().len(),
         metadata_json_compressed: metadata_json_size.stored_file_compressed,
         metadata_json_path,
         manifest_list_path,

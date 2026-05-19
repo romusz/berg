@@ -1647,12 +1647,16 @@ fn table_stats_header_properties(
             value: utc_and_local_timestamp_cell(retrieved_at),
         },
         Property {
+            label: "Updated at".to_string(),
+            value: utc_and_local_timestamp_cell(stats.snapshot_updated_at),
+        },
+        Property {
             label: "Snapshot ID".to_string(),
             value: Cell::value(DocumentValue::Number(stats.snapshot_id)),
         },
         Property {
-            label: "Updated at".to_string(),
-            value: utc_and_local_timestamp_cell(stats.snapshot_updated_at),
+            label: "Snapshot count".to_string(),
+            value: Cell::value(DocumentValue::Count(stats.retained_snapshot_count)),
         },
         Property {
             label: "Metadata".to_string(),
@@ -2265,6 +2269,7 @@ mod tests {
             snapshot_id: 42,
             snapshot_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
                 .expect("valid timestamp"),
+            retained_snapshot_count: 6,
             metadata_json_path: "s3://warehouse/table/metadata/00042.gz.metadata.json".to_string(),
             metadata_json_compressed: true,
             manifest_list_path: "s3://warehouse/table/metadata/snap-42.avro".to_string(),
@@ -2300,8 +2305,11 @@ mod tests {
         let Block::Properties(properties) = &document.blocks[0] else {
             panic!("first block should be properties");
         };
-        assert_eq!("Updated at", properties[3].label);
-        assert_eq!("Metadata", properties[4].label);
+        assert_eq!("Updated at", properties[2].label);
+        assert_eq!("Snapshot ID", properties[3].label);
+        assert_eq!("Snapshot count", properties[4].label);
+        assert_eq!(Cell::value(DocumentValue::Count(6)), properties[4].value);
+        assert_eq!("Metadata", properties[5].label);
 
         let Block::Section(table_files) = &document.blocks[1] else {
             panic!("second block should be table files section");

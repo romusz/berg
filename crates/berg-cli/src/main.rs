@@ -4,16 +4,16 @@ use std::ffi::OsString;
 use std::fmt::Write;
 
 use anyhow::{Context, anyhow};
+use berg_core::document::{Block, Cell, Document, DocumentValue, List, ListKind, Row, Table};
 use berg_core::engine::{
     QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats,
     load_current_manifest_file_detail, load_current_manifest_file_list, load_current_schema,
     load_current_table_max, load_current_table_partitions, load_current_table_properties,
     load_current_table_stats, parse_catalog_property,
 };
-use berg_core::view::{
-    Block, Cell, Document, DocumentValue, List, ListKind, data_file_size_stats_document,
-    manifest_file_detail_document, manifest_file_list_document, schema_document,
-    table_data_max_document, table_partitions_document, table_properties_document,
+use berg_core::report::{
+    data_file_size_stats_document, manifest_file_detail_document, manifest_file_list_document,
+    schema_document, table_data_max_document, table_partitions_document, table_properties_document,
     table_stats_document,
 };
 use clap::error::ErrorKind;
@@ -1007,7 +1007,7 @@ enum MarkdownTableColumn {
     BinarySize(usize),
 }
 
-fn render_table_markdown(table: &berg_core::view::Table, markdown: &mut String) {
+fn render_table_markdown(table: &Table, markdown: &mut String) {
     let columns = markdown_table_columns(table);
     let headers = columns
         .iter()
@@ -1030,7 +1030,7 @@ fn render_table_markdown(table: &berg_core::view::Table, markdown: &mut String) 
     }
 }
 
-fn markdown_table_columns(table: &berg_core::view::Table) -> Vec<MarkdownTableColumn> {
+fn markdown_table_columns(table: &Table) -> Vec<MarkdownTableColumn> {
     let mut columns = Vec::new();
 
     for index in 0..table.columns.len() {
@@ -1049,10 +1049,7 @@ fn markdown_table_columns(table: &berg_core::view::Table) -> Vec<MarkdownTableCo
     columns
 }
 
-fn render_table_header_markdown(
-    table: &berg_core::view::Table,
-    column: MarkdownTableColumn,
-) -> String {
+fn render_table_header_markdown(table: &Table, column: MarkdownTableColumn) -> String {
     match column {
         MarkdownTableColumn::Source(index) => table
             .columns
@@ -1065,10 +1062,7 @@ fn render_table_header_markdown(
     }
 }
 
-fn render_bytes_table_header_markdown(
-    table: &berg_core::view::Table,
-    column_index: usize,
-) -> String {
+fn render_bytes_table_header_markdown(table: &Table, column_index: usize) -> String {
     let label = table
         .columns
         .get(column_index)
@@ -1081,10 +1075,7 @@ fn render_bytes_table_header_markdown(
     }
 }
 
-fn render_binary_size_table_header_markdown(
-    table: &berg_core::view::Table,
-    column_index: usize,
-) -> String {
+fn render_binary_size_table_header_markdown(table: &Table, column_index: usize) -> String {
     let label = table
         .columns
         .get(column_index)
@@ -1097,7 +1088,7 @@ fn render_binary_size_table_header_markdown(
     }
 }
 
-fn render_table_cell_markdown(row: &berg_core::view::Row, column: MarkdownTableColumn) -> String {
+fn render_table_cell_markdown(row: &Row, column: MarkdownTableColumn) -> String {
     match column {
         MarkdownTableColumn::Source(index) => row
             .cells
@@ -1128,10 +1119,7 @@ fn render_binary_size_table_cell_markdown(cell: &Cell) -> String {
     }
 }
 
-fn markdown_table_column_separator(
-    table: &berg_core::view::Table,
-    column: MarkdownTableColumn,
-) -> &'static str {
+fn markdown_table_column_separator(table: &Table, column: MarkdownTableColumn) -> &'static str {
     if is_center_aligned_markdown_table_column(table, column) {
         ":---:"
     } else if is_right_aligned_markdown_table_column(table, column) {
@@ -1141,31 +1129,25 @@ fn markdown_table_column_separator(
     }
 }
 
-fn is_center_aligned_markdown_table_column(
-    table: &berg_core::view::Table,
-    column: MarkdownTableColumn,
-) -> bool {
+fn is_center_aligned_markdown_table_column(table: &Table, column: MarkdownTableColumn) -> bool {
     match column {
         MarkdownTableColumn::Source(index) => is_center_aligned_table_column(table, index),
         MarkdownTableColumn::Bytes(_) | MarkdownTableColumn::BinarySize(_) => false,
     }
 }
 
-fn is_right_aligned_markdown_table_column(
-    table: &berg_core::view::Table,
-    column: MarkdownTableColumn,
-) -> bool {
+fn is_right_aligned_markdown_table_column(table: &Table, column: MarkdownTableColumn) -> bool {
     match column {
         MarkdownTableColumn::Source(index) => is_right_aligned_table_column(table, index),
         MarkdownTableColumn::Bytes(_) | MarkdownTableColumn::BinarySize(_) => true,
     }
 }
 
-fn is_center_aligned_table_column(table: &berg_core::view::Table, column_index: usize) -> bool {
+fn is_center_aligned_table_column(table: &Table, column_index: usize) -> bool {
     column_index >= 2 && is_manifest_column_metadata_table(table)
 }
 
-fn is_manifest_column_metadata_table(table: &berg_core::view::Table) -> bool {
+fn is_manifest_column_metadata_table(table: &Table) -> bool {
     matches!(
         (table.columns.first(), table.columns.get(1)),
         (Some(column), Some(field_id))
@@ -1188,7 +1170,7 @@ fn text_cell_value(cell: &Cell) -> Option<&str> {
     }
 }
 
-fn is_right_aligned_table_column(table: &berg_core::view::Table, column_index: usize) -> bool {
+fn is_right_aligned_table_column(table: &Table, column_index: usize) -> bool {
     !table.rows.is_empty()
         && table.rows.iter().all(|row| {
             row.cells
@@ -1211,7 +1193,7 @@ fn is_numeric_table_cell(cell: &Cell) -> bool {
     }
 }
 
-fn is_bytes_table_column(table: &berg_core::view::Table, column_index: usize) -> bool {
+fn is_bytes_table_column(table: &Table, column_index: usize) -> bool {
     !table.rows.is_empty()
         && table.rows.iter().all(|row| {
             row.cells
@@ -1228,7 +1210,7 @@ fn is_bytes_or_na_table_cell(cell: &Cell) -> bool {
     }
 }
 
-fn is_binary_size_table_column(table: &berg_core::view::Table, column_index: usize) -> bool {
+fn is_binary_size_table_column(table: &Table, column_index: usize) -> bool {
     table
         .columns
         .get(column_index)
@@ -1457,7 +1439,7 @@ fn separate_utc_offset(time: &str) -> String {
 mod tests {
     use std::ffi::OsString;
 
-    use berg_core::view::{
+    use berg_core::document::{
         Block, Document, List, ListItem, ListKind, Property, Row, Section, Table,
     };
 

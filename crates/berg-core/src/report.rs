@@ -1,39 +1,25 @@
-//! Presentation-independent views over Iceberg data.
+//! Berg/Iceberg-specific report builders.
 //!
-//! Berg-shaped intermediate representations derived from Iceberg spec types.
-//! Roughly analogous to an AST: structured, semantic, presentation-agnostic.
-//! Frontends consume these views and decide how to render them
-//! (CLI text, TUI widgets, future GUI components).
+//! Reports turn Iceberg/domain data produced by [`crate::engine`] into the
+//! generic, presentation-neutral [`crate::document`] model. Final output is a
+//! renderer/frontend concern.
 //!
-//! ## What goes here
+//! ## Module vocabulary
 //!
-//! Types and pure functions that derive **information** from
-//! [`crate::spec`] types. Examples of likely future contents:
+//! - **document**: generic presentation-neutral model.
+//! - **report**: Berg/Iceberg-specific builders that create documents.
+//! - **render**: pure conversion from model to output format.
+//! - **view**: final UI representation, especially TUI widgets/screens.
 //!
-//! - `SchemaSummary` — fields rolled up with partition flags, nullability,
-//!   stats hints.
-//! - `SnapshotTimeline` — ordered traversal of a snapshot history.
-//! - `PartitionLayout` — partition spec viewed alongside the columns it touches.
-//! - `ManifestDigest` — manifest contents summarized for inspection.
-//!
-//! ## What does *not* go here
-//!
-//! - Final presentation: text strings, ANSI escapes, ratatui widgets, HTML.
-//!   Those live in the frontends.
-//! - Async I/O or catalog calls. Those live in [`crate::engine`].
-//! - Mirrors of Iceberg spec types. If [`crate::spec::Schema`] is enough for
-//!   both frontends, pass it through directly — don't introduce a wrapper.
-//!
-//! ## Pass-through default
-//!
-//! A view type is justified only when it removes real duplication or carries
-//! semantics frontends would otherwise compute themselves. When the iceberg
-//! spec type already conveys what the frontend needs, frontends consume
-//! [`crate::spec`] types directly.
+//! This module should not contain final presentation details such as Markdown,
+//! ANSI escapes, ratatui widgets, or HTML. Those belong in renderers/frontends.
 //!
 use std::borrow::Borrow;
 use std::collections::HashSet;
 
+use crate::document::{
+    Block, Cell, Document, DocumentValue, List, ListItem, ListKind, Property, Row, Section, Table,
+};
 use crate::engine::{
     BoundPrecision, CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
     CurrentTableMax, CurrentTablePartitionDistribution, CurrentTablePartitionStats,
@@ -45,191 +31,7 @@ use crate::engine::{
 use crate::spec::{ManifestFile, NestedFieldRef, PartitionSpec, Schema, Type};
 use time::OffsetDateTime;
 
-/// Semantic document AST shared by frontends.
-///
-/// This is intentionally close to a document model rather than a report model:
-/// frontends can render it as GitHub-flavored Markdown, terminal widgets, HTML,
-/// or another medium without recomputing Iceberg-derived semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Document {
-    /// Top-level document title.
-    pub title: Cell,
-    /// Ordered document blocks.
-    pub blocks: Vec<Block>,
-}
-
-/// Block-level semantic content.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Block {
-    /// Paragraph-like inline content.
-    Paragraph(Cell),
-    /// Ordered key/value properties.
-    Properties(Vec<Property>),
-    /// Tabular content.
-    Table(Table),
-    /// Nested section. Markdown renderers should increase heading depth for
-    /// each nested section.
-    Section(Section),
-    /// Ordered or unordered list.
-    List(List),
-    /// Fenced code block.
-    FencedCode(FencedCode),
-    /// Horizontal rule / thematic break.
-    ThematicBreak,
-}
-
-/// Nested section with its own ordered blocks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Section {
-    /// Section heading.
-    pub title: Cell,
-    /// Section body blocks.
-    pub blocks: Vec<Block>,
-}
-
-/// Ordered or unordered list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct List {
-    /// List marker style.
-    pub kind: ListKind,
-    /// Ordered list items.
-    pub items: Vec<ListItem>,
-}
-
-/// List marker style.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ListKind {
-    /// Bullet list.
-    Unordered,
-    /// Numbered list.
-    Ordered {
-        /// First rendered number.
-        start: usize,
-    },
-}
-
-/// One list item.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListItem {
-    /// Item body blocks.
-    pub blocks: Vec<Block>,
-}
-
-/// Semantic key/value property.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Property {
-    /// Property label.
-    pub label: String,
-    /// Property value.
-    pub value: Cell,
-}
-
-/// Semantic table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Table {
-    /// Ordered column labels.
-    pub columns: Vec<Cell>,
-    /// Ordered rows.
-    pub rows: Vec<Row>,
-}
-
-/// Semantic table row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Row {
-    /// Ordered row cells.
-    pub cells: Vec<Cell>,
-}
-
-/// Inline content container used by titles, paragraphs, properties, lists, and tables.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cell {
-    /// Ordered inline values.
-    pub values: Vec<DocumentValue>,
-}
-
-impl Cell {
-    /// Build a cell from inline values.
-    #[must_use]
-    pub fn new(values: Vec<DocumentValue>) -> Self {
-        Self { values }
-    }
-
-    /// Build a plain-text cell.
-    #[must_use]
-    pub fn text(value: impl Into<String>) -> Self {
-        Self::new(vec![DocumentValue::Text(value.into())])
-    }
-
-    /// Build a code-like cell.
-    #[must_use]
-    pub fn code(value: impl Into<String>) -> Self {
-        Self::new(vec![DocumentValue::Code(value.into())])
-    }
-
-    /// Build a cell containing a single semantic value.
-    #[must_use]
-    pub fn value(value: DocumentValue) -> Self {
-        Self::new(vec![value])
-    }
-}
-
-/// Fenced code block content.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FencedCode {
-    /// Optional language tag.
-    pub language: Option<String>,
-    /// Code body.
-    pub code: String,
-}
-
-/// Semantic inline value that each frontend renders in its own medium.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DocumentValue {
-    /// Plain text.
-    Text(String),
-    /// Code-like text, such as field paths, type names, or identifiers.
-    Code(String),
-    /// URI or URL value.
-    Uri(String),
-    /// Instant in time.
-    Timestamp(OffsetDateTime),
-    /// Instant in local time.
-    LocalTimestamp(OffsetDateTime),
-    /// Numeric value.
-    Number(i64),
-    /// Unsigned numeric value.
-    Unsigned(u64),
-    /// Byte size value.
-    Bytes(u64),
-    /// Percentage stored as thousandths of one percent.
-    PercentageMillis(u64),
-    /// Non-negative count.
-    Count(usize),
-    /// Boolean value.
-    Bool(bool),
-    /// Emphasized inline values.
-    Emphasis(Vec<DocumentValue>),
-    /// Strongly emphasized inline values.
-    Strong(Vec<DocumentValue>),
-    /// Link with inline label and target URI.
-    Link {
-        /// Link label.
-        label: Vec<DocumentValue>,
-        /// Link target.
-        target: String,
-    },
-    /// Image with alt text and source URI.
-    Image {
-        /// Image alt text.
-        alt: String,
-        /// Image source.
-        source: String,
-    },
-    /// Hard line break.
-    LineBreak,
-}
-
-/// Build a semantic document view from an Iceberg schema.
+/// Build a document from an Iceberg schema report.
 #[must_use]
 pub fn schema_document(
     table_ident: impl Into<String>,
@@ -300,7 +102,7 @@ pub fn schema_document(
     }
 }
 
-/// Build a semantic document view from current Iceberg table statistics.
+/// Build a document from current Iceberg table statistics.
 #[must_use]
 pub fn table_stats_document(
     table_ident: impl Into<String>,
@@ -349,7 +151,7 @@ pub fn table_stats_document(
     }
 }
 
-/// Build a semantic document view from current Iceberg table properties.
+/// Build a document from current Iceberg table properties.
 #[must_use]
 pub fn table_properties_document(
     table_ident: impl Into<String>,
@@ -378,7 +180,7 @@ pub fn table_properties_document(
     }
 }
 
-/// Build a semantic document view from current Iceberg data file size statistics.
+/// Build a document from current Iceberg data file size statistics.
 #[must_use]
 pub fn data_file_size_stats_document(
     table_ident: impl Into<String>,
@@ -419,7 +221,7 @@ pub fn data_file_size_stats_document(
     }
 }
 
-/// Build a semantic document view from a metadata-derived current snapshot max result.
+/// Build a document from a metadata-derived current snapshot max result.
 #[must_use]
 pub fn table_data_max_document(
     table_ident: impl Into<String>,
@@ -494,7 +296,7 @@ pub fn table_data_max_document(
     }
 }
 
-/// Build a semantic document view from current snapshot manifest files.
+/// Build a document from current snapshot manifest files.
 #[must_use]
 pub fn manifest_file_list_document(
     table_ident: impl Into<String>,
@@ -523,7 +325,7 @@ pub fn manifest_file_list_document(
     }
 }
 
-/// Build a semantic document view from one selected current snapshot manifest file.
+/// Build a document from one selected current snapshot manifest file.
 #[must_use]
 pub fn manifest_file_detail_document(
     table_ident: impl Into<String>,
@@ -562,7 +364,7 @@ pub fn manifest_file_detail_document(
     }
 }
 
-/// Build a semantic document view from the current partition spec and partition statistics.
+/// Build a document from the current partition spec and partition statistics.
 #[must_use]
 pub fn table_partitions_document(
     table_ident: impl Into<String>,

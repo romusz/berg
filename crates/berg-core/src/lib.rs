@@ -1,7 +1,14 @@
 //! Shared core for Berg — Apache Iceberg tooling.
 //!
 //! This crate is consumed by the `berg-cli` and `berg-tui` frontends and houses
-//! all logic that is not specific to a single user interface.
+//! shared domain logic plus presentation-neutral document/report models.
+//!
+//! ## Module vocabulary
+//!
+//! - **document**: generic presentation-neutral model.
+//! - **report**: Berg/Iceberg-specific builders that create documents.
+//! - **render**: pure conversion from model to output format.
+//! - **view**: final UI representation, especially TUI widgets/screens.
 //!
 //! ## Iceberg surface
 //!
@@ -9,9 +16,10 @@
 //! Frontends depend on `berg-core` and consume Iceberg spec types via the
 //! re-exports below; they do not declare `iceberg` as a direct dependency.
 
+pub mod document;
 pub mod engine;
 pub mod error;
-pub mod view;
+pub mod report;
 
 pub use error::{BergError, Result};
 
@@ -19,8 +27,8 @@ pub use error::{BergError, Result};
 /// `TableMetadata`, and so on.
 ///
 /// Re-exported verbatim from [`iceberg::spec`]. Frontends consume these as
-/// plain data; `berg-core::engine` returns them, and `berg-core::view`
-/// derives presentation-independent intermediates from them.
+/// plain data; `berg-core::engine` returns them, and `berg-core::report`
+/// derives presentation-independent documents from them.
 pub use iceberg::spec;
 
 /// Iceberg identifier types — `NamespaceIdent`, `TableIdent`.

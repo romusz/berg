@@ -325,6 +325,16 @@ pub fn table_stats_document(
                 stats,
             )),
             Block::Section(Section {
+                title: Cell::text("Partitioning"),
+                blocks: vec![
+                    Block::Properties(table_stats_partitioning_properties(stats)),
+                    Block::Table(partition_spec_table(
+                        &stats.current_schema,
+                        &stats.partition_spec,
+                    )),
+                ],
+            }),
+            Block::Section(Section {
                 title: Cell::text("Table Files"),
                 blocks: vec![Block::Properties(table_file_properties(stats))],
             }),
@@ -576,7 +586,7 @@ pub fn table_partitions_document(
             Block::Section(Section {
                 title: Cell::text("Current Partition Spec"),
                 blocks: vec![
-                    Block::Properties(current_partition_spec_properties(stats)),
+                    Block::Properties(current_partition_spec_properties(&stats.partition_spec)),
                     Block::Table(partition_spec_table(
                         &stats.current_schema,
                         &stats.partition_spec,
@@ -1355,14 +1365,8 @@ fn table_partitions_header_properties(
     ]
 }
 
-fn current_partition_spec_properties(stats: &CurrentTablePartitions) -> Vec<Property> {
+fn table_stats_partitioning_properties(stats: &CurrentTableStats) -> Vec<Property> {
     vec![
-        Property {
-            label: "Default spec ID".to_string(),
-            value: Cell::value(DocumentValue::Number(i64::from(
-                stats.partition_spec.spec_id(),
-            ))),
-        },
         Property {
             label: "Partitioned".to_string(),
             value: Cell::value(DocumentValue::Bool(
@@ -1370,8 +1374,49 @@ fn current_partition_spec_properties(stats: &CurrentTablePartitions) -> Vec<Prop
             )),
         },
         Property {
+            label: "Partitions".to_string(),
+            value: Cell::value(DocumentValue::Count(stats.partition_count)),
+        },
+        Property {
             label: "Fields".to_string(),
             value: Cell::value(DocumentValue::Count(stats.partition_spec.fields().len())),
+        },
+        Property {
+            label: "Files per partition".to_string(),
+            value: Cell::code(files_per_partition(stats)),
+        },
+        Property {
+            label: "Default spec ID".to_string(),
+            value: Cell::value(DocumentValue::Number(i64::from(
+                stats.partition_spec.spec_id(),
+            ))),
+        },
+    ]
+}
+
+fn files_per_partition(stats: &CurrentTableStats) -> String {
+    if stats.partition_count == 0 {
+        return "0.00".to_string();
+    }
+
+    let partitions = u128::try_from(stats.partition_count).expect("usize fits in u128");
+    let hundredths = (u128::from(stats.data_file_count) * 100 + partitions / 2) / partitions;
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
+fn current_partition_spec_properties(partition_spec: &PartitionSpec) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Default spec ID".to_string(),
+            value: Cell::value(DocumentValue::Number(i64::from(partition_spec.spec_id()))),
+        },
+        Property {
+            label: "Partitioned".to_string(),
+            value: Cell::value(DocumentValue::Bool(!partition_spec.is_unpartitioned())),
+        },
+        Property {
+            label: "Fields".to_string(),
+            value: Cell::value(DocumentValue::Count(partition_spec.fields().len())),
         },
     ]
 }
@@ -2264,7 +2309,20 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "document shape assertions are intentionally explicit"
+    )]
     fn builds_current_table_stats_document() {
+        let schema = Arc::new(nested_schema());
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(3)
+                .add_partition_field("org_id", "org_id", Transform::Identity)
+                .expect("valid partition field")
+                .build()
+                .expect("valid partition spec"),
+        );
         let stats = CurrentTableStats {
             snapshot_id: 42,
             snapshot_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
@@ -2273,13 +2331,16 @@ mod tests {
             metadata_json_path: "s3://warehouse/table/metadata/00042.gz.metadata.json".to_string(),
             metadata_json_compressed: true,
             manifest_list_path: "s3://warehouse/table/metadata/snap-42.avro".to_string(),
+            current_schema: schema,
+            partition_spec,
             total_table_file_size_bytes: 700,
-            data_file_count: 3,
+            data_file_count: 461,
             position_delete_file_count: 1,
             position_delete_record_count: 50,
             equality_delete_file_count: 2,
             equality_delete_record_count: 25,
             record_count: 900,
+            partition_count: 8,
             manifest_file_count: 4,
             manifest_list_size_bytes: 100,
             manifest_files_size_bytes: 200,
@@ -2311,8 +2372,51 @@ mod tests {
         assert_eq!(Cell::value(DocumentValue::Count(6)), properties[4].value);
         assert_eq!("Metadata", properties[5].label);
 
-        let Block::Section(table_files) = &document.blocks[1] else {
-            panic!("second block should be table files section");
+        let Block::Section(partitioning) = &document.blocks[1] else {
+            panic!("second block should be partitioning section");
+        };
+        let Block::Properties(partitioning_properties) = &partitioning.blocks[0] else {
+            panic!("partitioning section should contain properties");
+        };
+        assert_eq!("Partitioned", partitioning_properties[0].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Bool(true)),
+            partitioning_properties[0].value
+        );
+        assert_eq!("Partitions", partitioning_properties[1].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Count(8)),
+            partitioning_properties[1].value
+        );
+        assert_eq!("Fields", partitioning_properties[2].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Count(1)),
+            partitioning_properties[2].value
+        );
+        assert_eq!("Files per partition", partitioning_properties[3].label);
+        assert_eq!(Cell::code("57.63"), partitioning_properties[3].value);
+        assert_eq!("Default spec ID", partitioning_properties[4].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Number(3)),
+            partitioning_properties[4].value
+        );
+        let Block::Table(spec_table) = &partitioning.blocks[1] else {
+            panic!("partitioning section should contain a spec table");
+        };
+        assert_eq!(
+            vec![
+                Cell::code("org_id"),
+                Cell::code("org_id"),
+                Cell::code("long"),
+                Cell::code("identity"),
+                Cell::value(DocumentValue::Number(1)),
+                Cell::value(DocumentValue::Number(1000)),
+            ],
+            spec_table.rows[0].cells
+        );
+
+        let Block::Section(table_files) = &document.blocks[2] else {
+            panic!("third block should be table files section");
         };
         let Block::Properties(table_file_properties) = &table_files.blocks[0] else {
             panic!("table files section should contain properties");
@@ -2336,8 +2440,8 @@ mod tests {
             table_file_properties[6].value
         );
 
-        let Block::Section(metadata_files) = &document.blocks[2] else {
-            panic!("third block should be metadata files section");
+        let Block::Section(metadata_files) = &document.blocks[3] else {
+            panic!("fourth block should be metadata files section");
         };
         let Block::Properties(metadata_file_properties) = &metadata_files.blocks[0] else {
             panic!("metadata files section should contain properties");

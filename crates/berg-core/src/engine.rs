@@ -168,6 +168,10 @@ pub struct CurrentTableStats {
     pub metadata_json_compressed: bool,
     /// Current snapshot manifest list location.
     pub manifest_list_path: String,
+    /// Current table schema used to describe the default partition spec.
+    pub current_schema: spec::SchemaRef,
+    /// Default partition spec for new writes.
+    pub partition_spec: spec::PartitionSpecRef,
     /// Total bytes across live data files and live delete files.
     pub total_table_file_size_bytes: u64,
     /// Number of live data files.
@@ -182,6 +186,8 @@ pub struct CurrentTableStats {
     pub equality_delete_record_count: u64,
     /// Number of records in live data files.
     pub record_count: u64,
+    /// Number of distinct current data partitions with live data files.
+    pub partition_count: usize,
     /// Number of manifest files in the current snapshot manifest list.
     pub manifest_file_count: u64,
     /// Size of the current snapshot manifest list file.
@@ -761,6 +767,8 @@ pub async fn load_current_table_stats(
         metadata_json_compressed,
     )
     .await?;
+    let current_schema = metadata.current_schema().clone();
+    let partition_spec = metadata.default_partition_spec().clone();
     let manifest_list = snapshot
         .load_manifest_list(table.file_io(), &table.metadata_ref())
         .await?;
@@ -773,6 +781,8 @@ pub async fn load_current_table_stats(
         metadata_json_compressed: metadata_json_size.stored_file_compressed,
         metadata_json_path,
         manifest_list_path,
+        current_schema,
+        partition_spec,
         total_table_file_size_bytes: 0,
         data_file_count: 0,
         position_delete_file_count: 0,
@@ -780,41 +790,24 @@ pub async fn load_current_table_stats(
         equality_delete_file_count: 0,
         equality_delete_record_count: 0,
         record_count: 0,
+        partition_count: 0,
         manifest_file_count: manifest_list.entries().len() as u64,
         manifest_list_size_bytes,
         manifest_files_size_bytes,
         metadata_json_size_bytes,
         metadata_json_uncompressed_size_bytes: metadata_json_size.decoded_size_bytes,
     };
+    let mut partitions = HashSet::<(i32, String)>::new();
 
     visit_live_manifest_files(
         &table,
         &manifest_list,
         |_| true,
-        |live_manifest| {
-            for entry in live_manifest_entries(&live_manifest.manifest) {
-                stats.total_table_file_size_bytes += entry.file_size_in_bytes();
-
-                match entry.content_type() {
-                    DataContentType::Data => {
-                        stats.data_file_count += 1;
-                        stats.record_count += entry.record_count();
-                    }
-                    DataContentType::PositionDeletes => {
-                        stats.position_delete_file_count += 1;
-                        stats.position_delete_record_count += entry.record_count();
-                    }
-                    DataContentType::EqualityDeletes => {
-                        stats.equality_delete_file_count += 1;
-                        stats.equality_delete_record_count += entry.record_count();
-                    }
-                }
-            }
-
-            Ok(())
-        },
+        |live_manifest| record_live_manifest_stats(&mut stats, &mut partitions, &live_manifest),
     )
     .await?;
+
+    stats.partition_count = partitions.len();
 
     Ok(stats)
 }
@@ -1116,8 +1109,53 @@ pub async fn load_current_table_partitions(
 }
 
 struct LiveManifest {
+    content: ManifestContentType,
     partition_spec_id: i32,
     manifest: spec::Manifest,
+}
+
+fn record_live_manifest_stats(
+    stats: &mut CurrentTableStats,
+    partitions: &mut HashSet<(i32, String)>,
+    live_manifest: &LiveManifest,
+) -> Result<()> {
+    let manifest_spec = live_manifest.manifest.metadata().partition_spec();
+    let manifest_partition_type = if live_manifest.content == ManifestContentType::Data {
+        Some(manifest_spec.partition_type(live_manifest.manifest.metadata().schema())?)
+    } else {
+        None
+    };
+
+    for entry in live_manifest_entries(&live_manifest.manifest) {
+        stats.total_table_file_size_bytes += entry.file_size_in_bytes();
+
+        match entry.content_type() {
+            DataContentType::Data => {
+                stats.data_file_count += 1;
+                stats.record_count += entry.record_count();
+                if let Some(partition_type) = &manifest_partition_type {
+                    partitions.insert((
+                        live_manifest.partition_spec_id,
+                        partition_path(
+                            manifest_spec,
+                            partition_type,
+                            entry.data_file().partition(),
+                        ),
+                    ));
+                }
+            }
+            DataContentType::PositionDeletes => {
+                stats.position_delete_file_count += 1;
+                stats.position_delete_record_count += entry.record_count();
+            }
+            DataContentType::EqualityDeletes => {
+                stats.equality_delete_file_count += 1;
+                stats.equality_delete_record_count += entry.record_count();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2503,9 +2541,7 @@ fn equality_delete_impact(statuses: &[CandidateDeleteStatus]) -> DeleteImpact {
         .iter()
         .filter(|status| status.equality.has_effect)
         .count();
-    let unknown = statuses
-        .iter()
-        .any(|status| status.equality.has_unknown);
+    let unknown = statuses.iter().any(|status| status.equality.has_unknown);
 
     if unaffected > 0 && affected > 0 {
         DeleteImpact::PartiallyAffected
@@ -2533,9 +2569,7 @@ fn position_delete_impact(statuses: &[CandidateDeleteStatus]) -> DeleteImpact {
         .iter()
         .filter(|status| status.position.has_effect)
         .count();
-    let unknown = statuses
-        .iter()
-        .any(|status| status.position.has_unknown);
+    let unknown = statuses.iter().any(|status| status.position.has_unknown);
 
     if untouched > 0 && touched > 0 {
         DeleteImpact::PartiallyAffected
@@ -2789,6 +2823,7 @@ where
         }
 
         visit(LiveManifest {
+            content: manifest_file.content,
             partition_spec_id: manifest_file.partition_spec_id,
             manifest: manifest_file.load_manifest(table.file_io()).await?,
         })?;

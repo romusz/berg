@@ -556,6 +556,8 @@ pub struct CurrentTablePartitions {
     pub bucket_labels: Vec<String>,
     /// Live data files grouped by partition spec ID and partition value.
     pub partitions: Vec<CurrentTablePartitionStats>,
+    /// Percentile distributions across partitions.
+    pub partition_distribution: Option<CurrentTablePartitionDistribution>,
 }
 
 /// Data file statistics for one current snapshot partition.
@@ -602,6 +604,36 @@ pub struct DataFileSizeDistribution {
     /// 95th percentile data file size.
     pub p95: u64,
     /// Largest data file size.
+    pub max: u64,
+}
+
+/// Nearest-rank percentile distributions across current snapshot partitions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentTablePartitionDistribution {
+    /// Data file count distribution across partitions.
+    pub files: PartitionMetricDistribution,
+    /// Total data size distribution across partitions.
+    pub total_size_bytes: PartitionMetricDistribution,
+}
+
+/// Nearest-rank percentile distribution for a per-partition metric.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionMetricDistribution {
+    /// Smallest observed value.
+    pub min: u64,
+    /// 25th percentile value.
+    pub p25: u64,
+    /// 50th percentile (median) value.
+    pub p50: u64,
+    /// 75th percentile value.
+    pub p75: u64,
+    /// 90th percentile value.
+    pub p90: u64,
+    /// 95th percentile value.
+    pub p95: u64,
+    /// 99th percentile value.
+    pub p99: u64,
+    /// Largest observed value.
     pub max: u64,
 }
 
@@ -1092,6 +1124,7 @@ pub async fn load_current_table_partitions(
 
     let partitions =
         partition_stats_from_accumulators(partition_accumulators, target_file_size_bytes);
+    let partition_distribution = partition_distribution(&partitions);
 
     Ok(CurrentTablePartitions {
         snapshot_id: snapshot.snapshot_id(),
@@ -1105,6 +1138,7 @@ pub async fn load_current_table_partitions(
         data_file_count,
         bucket_labels,
         partitions,
+        partition_distribution,
     })
 }
 
@@ -3241,6 +3275,43 @@ fn data_file_size_distribution(sorted_values: &[u64]) -> Option<DataFileSizeDist
     })
 }
 
+fn partition_distribution(
+    partitions: &[CurrentTablePartitionStats],
+) -> Option<CurrentTablePartitionDistribution> {
+    if partitions.is_empty() {
+        return None;
+    }
+
+    let mut counts: Vec<u64> = partitions
+        .iter()
+        .map(|partition| partition.file_count)
+        .collect();
+    counts.sort_unstable();
+    let mut sizes: Vec<u64> = partitions
+        .iter()
+        .map(|partition| partition.total_size_bytes)
+        .collect();
+    sizes.sort_unstable();
+
+    Some(CurrentTablePartitionDistribution {
+        files: nearest_rank_distribution(&counts)?,
+        total_size_bytes: nearest_rank_distribution(&sizes)?,
+    })
+}
+
+fn nearest_rank_distribution(sorted_values: &[u64]) -> Option<PartitionMetricDistribution> {
+    Some(PartitionMetricDistribution {
+        min: *sorted_values.first()?,
+        p25: nearest_rank_percentile(sorted_values, 25, 100),
+        p50: nearest_rank_percentile(sorted_values, 50, 100),
+        p75: nearest_rank_percentile(sorted_values, 75, 100),
+        p90: nearest_rank_percentile(sorted_values, 90, 100),
+        p95: nearest_rank_percentile(sorted_values, 95, 100),
+        p99: nearest_rank_percentile(sorted_values, 99, 100),
+        max: *sorted_values.last()?,
+    })
+}
+
 fn data_file_size_buckets(
     sorted_values: &[u64],
     target_file_size_bytes: u64,
@@ -3375,6 +3446,16 @@ fn percentile(sorted_values: &[u64], numerator: usize, denominator: usize) -> u6
         lower_value * denominator + (upper_value - lower_value) * remainder + denominator / 2;
 
     u128_to_u64_saturating(interpolated / denominator)
+}
+
+fn nearest_rank_percentile(sorted_values: &[u64], numerator: usize, denominator: usize) -> u64 {
+    debug_assert!(!sorted_values.is_empty());
+    debug_assert!(denominator > 0);
+
+    let rank = (sorted_values.len() * numerator).div_ceil(denominator);
+    let index = rank.saturating_sub(1).min(sorted_values.len() - 1);
+
+    sorted_values[index]
 }
 
 async fn metadata_json_size(
@@ -3595,13 +3676,14 @@ mod tests {
         BoundPrecision, COLUMN_METADATA_COLUMN_SIZES, COLUMN_METADATA_LOWER_BOUNDS,
         COLUMN_METADATA_NULL_VALUE_COUNTS, COLUMN_METADATA_VALUE_COUNTS, CandidateDeleteStatus,
         CandidateFile, ColumnMetadataAccumulator, CurrentMetricsMode, CurrentTableMaxAnalysis,
-        DataFileSizeDistribution, DeleteFileInfo, DeleteImpact, MaxConfidence,
-        PartitionAccumulator, QualifiedTableIdent, ReadCompleteness, RestCatalogConfig,
+        CurrentTablePartitionDistribution, CurrentTablePartitionStats, DataFileSizeDistribution,
+        DeleteFileInfo, DeleteImpact, MaxConfidence, PartitionAccumulator,
+        PartitionMetricDistribution, QualifiedTableIdent, ReadCompleteness, RestCatalogConfig,
         TypeCompatibility, collect_delete_files, credential_from_env_output,
         data_file_size_buckets, data_file_size_distribution, find_manifest_file_by_id,
         is_compressed_metadata_json, manifest_file_list_entries, manifest_partition_metadata,
-        max_precision, metadata_json_size, parse_catalog_property, partition_path,
-        partition_stats_from_accumulators, read_parquet_position_delete_file_paths,
+        max_precision, metadata_json_size, parse_catalog_property, partition_distribution,
+        partition_path, partition_stats_from_accumulators, read_parquet_position_delete_file_paths,
         resolve_current_column_path, rounded_average, schema_field_paths,
     };
 
@@ -3687,6 +3769,95 @@ AWS_SESSION_TOKEN='token'
                 p75: 400,
                 p95: 480,
                 max: 500,
+            },
+            distribution
+        );
+    }
+
+    #[test]
+    fn computes_partition_distribution() {
+        // Deliberately unsorted to confirm the helper sorts before computing percentiles.
+        let partitions: Vec<CurrentTablePartitionStats> =
+            [50_u64, 10, 30, 80, 70, 90, 60, 20, 100, 40]
+                .into_iter()
+                .map(|file_count| CurrentTablePartitionStats {
+                    partition_spec_id: 0,
+                    partition: format!("p={file_count}"),
+                    file_count,
+                    total_size_bytes: file_count * 1_000,
+                    buckets: Vec::new(),
+                })
+                .collect();
+
+        let distribution = partition_distribution(&partitions).expect("distribution");
+
+        // Nearest-rank percentiles over sorted values [10, 20, ..., 100].
+        assert_eq!(
+            CurrentTablePartitionDistribution {
+                files: PartitionMetricDistribution {
+                    min: 10,
+                    p25: 30,
+                    p50: 50,
+                    p75: 80,
+                    p90: 90,
+                    p95: 100,
+                    p99: 100,
+                    max: 100,
+                },
+                total_size_bytes: PartitionMetricDistribution {
+                    min: 10_000,
+                    p25: 30_000,
+                    p50: 50_000,
+                    p75: 80_000,
+                    p90: 90_000,
+                    p95: 100_000,
+                    p99: 100_000,
+                    max: 100_000,
+                },
+            },
+            distribution
+        );
+    }
+
+    #[test]
+    fn returns_no_partition_distribution_when_empty() {
+        assert!(partition_distribution(&[]).is_none());
+    }
+
+    #[test]
+    fn computes_partition_distribution_for_single_partition() {
+        let partitions = vec![CurrentTablePartitionStats {
+            partition_spec_id: 0,
+            partition: "p=solo".to_string(),
+            file_count: 7,
+            total_size_bytes: 700,
+            buckets: Vec::new(),
+        }];
+
+        let distribution = partition_distribution(&partitions).expect("distribution");
+
+        assert_eq!(
+            CurrentTablePartitionDistribution {
+                files: PartitionMetricDistribution {
+                    min: 7,
+                    p25: 7,
+                    p50: 7,
+                    p75: 7,
+                    p90: 7,
+                    p95: 7,
+                    p99: 7,
+                    max: 7,
+                },
+                total_size_bytes: PartitionMetricDistribution {
+                    min: 700,
+                    p25: 700,
+                    p50: 700,
+                    p75: 700,
+                    p90: 700,
+                    p95: 700,
+                    p99: 700,
+                    max: 700,
+                },
             },
             distribution
         );

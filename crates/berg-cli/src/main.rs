@@ -1035,8 +1035,12 @@ fn markdown_table_columns(table: &berg_core::view::Table) -> Vec<MarkdownTableCo
 
     for index in 0..table.columns.len() {
         if is_bytes_table_column(table, index) {
-            columns.push(MarkdownTableColumn::Bytes(index));
-            columns.push(MarkdownTableColumn::BinarySize(index));
+            if is_binary_size_table_column(table, index) {
+                columns.push(MarkdownTableColumn::BinarySize(index));
+            } else {
+                columns.push(MarkdownTableColumn::Bytes(index));
+                columns.push(MarkdownTableColumn::BinarySize(index));
+            }
         } else {
             columns.push(MarkdownTableColumn::Source(index));
         }
@@ -1086,7 +1090,7 @@ fn render_binary_size_table_header_markdown(
         .get(column_index)
         .map_or_else(String::new, render_cell_markdown);
 
-    if label == "Size" {
+    if label == "Size" || label == "Binary size" {
         "Binary size".to_string()
     } else {
         format!("{label} (binary)")
@@ -1222,6 +1226,13 @@ fn is_bytes_or_na_table_cell(cell: &Cell) -> bool {
         [DocumentValue::Text(value)] if value == "n/a" => true,
         _ => false,
     }
+}
+
+fn is_binary_size_table_column(table: &berg_core::view::Table, column_index: usize) -> bool {
+    table
+        .columns
+        .get(column_index)
+        .is_some_and(|column| render_cell_markdown(column) == "Binary size")
 }
 
 fn render_list_markdown(list: &List, heading_level: usize, markdown: &mut String) {
@@ -1564,6 +1575,26 @@ mod tests {
         assert!(markdown.contains("1. Load table metadata"));
         assert!(markdown.contains("2. Derive schema view"));
         assert!(markdown.contains("   - Flatten nested fields"));
+    }
+
+    #[test]
+    fn renders_binary_size_table_cells_without_bytes_column() {
+        let document = Document {
+            title: Cell::text("Partition distribution"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![Cell::text("Percentile"), Cell::text("Binary size")],
+                rows: vec![Row {
+                    cells: vec![Cell::text("p50"), Cell::value(DocumentValue::Bytes(2048))],
+                }],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(markdown.contains("| Percentile | Binary size |"));
+        assert!(markdown.contains("| --- | ---: |"));
+        assert!(markdown.contains("| p50 | `2.000 KiB` |"));
+        assert!(!markdown.contains("| Percentile | Bytes | Binary size |"));
     }
 
     #[test]

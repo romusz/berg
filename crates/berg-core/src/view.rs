@@ -36,11 +36,11 @@ use std::collections::HashSet;
 
 use crate::engine::{
     BoundPrecision, CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
-    CurrentTableMax, CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableProperties,
-    CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
-    DeleteAnalysisCompleteness, DeleteImpact, ManifestColumnMetadataSummary, ManifestFileListEntry,
-    ManifestPartitionMetadataSummary, MaxConfidence, ReadCompleteness, TablePropertyEntry,
-    TypeCompatibility,
+    CurrentTableMax, CurrentTablePartitionDistribution, CurrentTablePartitionStats,
+    CurrentTablePartitions, CurrentTableProperties, CurrentTableStats, DataFileSizeBucketStats,
+    DataFileSizeDistribution, DeleteAnalysisCompleteness, DeleteImpact,
+    ManifestColumnMetadataSummary, ManifestFileListEntry, ManifestPartitionMetadataSummary,
+    MaxConfidence, ReadCompleteness, TablePropertyEntry, TypeCompatibility,
 };
 use crate::spec::{ManifestFile, NestedFieldRef, PartitionSpec, Schema, Type};
 use time::OffsetDateTime;
@@ -597,6 +597,12 @@ pub fn table_partitions_document(
                 title: Cell::text("Partitions"),
                 blocks: vec![
                     Block::Properties(partition_summary_properties(stats)),
+                    Block::Section(Section {
+                        title: Cell::text("Partition distribution"),
+                        blocks: vec![Block::Table(partition_distribution_table(
+                            stats.partition_distribution.as_ref(),
+                        ))],
+                    }),
                     Block::Paragraph(Cell::text(
                         "Bucket columns contain data file counts, not bytes or percentages.",
                     )),
@@ -1395,13 +1401,8 @@ fn table_stats_partitioning_properties(stats: &CurrentTableStats) -> Vec<Propert
 }
 
 fn files_per_partition(stats: &CurrentTableStats) -> String {
-    if stats.partition_count == 0 {
-        return "0.00".to_string();
-    }
-
-    let partitions = u128::try_from(stats.partition_count).expect("usize fits in u128");
-    let hundredths = (u128::from(stats.data_file_count) * 100 + partitions / 2) / partitions;
-    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+    files_per_partition_value(stats.data_file_count, stats.partition_count)
+        .unwrap_or_else(|| "0.00".to_string())
 }
 
 fn current_partition_spec_properties(partition_spec: &PartitionSpec) -> Vec<Property> {
@@ -1432,6 +1433,17 @@ fn partition_summary_properties(stats: &CurrentTablePartitions) -> Vec<Property>
             value: Cell::value(DocumentValue::Unsigned(stats.data_file_count)),
         },
         Property {
+            label: "Files per partition".to_string(),
+            value: files_per_partition_cell(stats.data_file_count, stats.partitions.len()),
+        },
+        Property {
+            label: "Data per partition".to_string(),
+            value: optional_bytes_cell(bytes_per_partition(
+                stats.total_data_file_size_bytes,
+                stats.partitions.len(),
+            )),
+        },
+        Property {
             label: "Total data file size".to_string(),
             value: Cell::value(DocumentValue::Bytes(stats.total_data_file_size_bytes)),
         },
@@ -1440,6 +1452,33 @@ fn partition_summary_properties(stats: &CurrentTablePartitions) -> Vec<Property>
             value: Cell::value(DocumentValue::Bytes(stats.target_file_size_bytes)),
         },
     ]
+}
+
+fn files_per_partition_cell(data_file_count: u64, partition_count: usize) -> Cell {
+    files_per_partition_value(data_file_count, partition_count)
+        .map_or_else(|| Cell::text("n/a"), Cell::code)
+}
+
+fn files_per_partition_value(data_file_count: u64, partition_count: usize) -> Option<String> {
+    if partition_count == 0 {
+        return None;
+    }
+
+    let partitions = u128::try_from(partition_count).expect("usize fits in u128");
+    let hundredths = (u128::from(data_file_count) * 100 + partitions / 2) / partitions;
+
+    Some(format!("{}.{:02}", hundredths / 100, hundredths % 100))
+}
+
+fn bytes_per_partition(total_size_bytes: u64, partition_count: usize) -> Option<u64> {
+    if partition_count == 0 {
+        return None;
+    }
+
+    let partitions = u128::try_from(partition_count).expect("usize fits in u128");
+    let average = (u128::from(total_size_bytes) + partitions / 2) / partitions;
+
+    Some(u64::try_from(average).expect("average partition size fits in u64"))
 }
 
 fn partition_spec_table(schema: &Schema, partition_spec: &PartitionSpec) -> Table {
@@ -1617,6 +1656,76 @@ fn data_file_size_distribution_table(distribution: Option<&DataFileSizeDistribut
 fn data_file_size_distribution_row(label: &str, size_bytes: Option<u64>) -> Row {
     Row {
         cells: vec![Cell::text(label), optional_bytes_cell(size_bytes)],
+    }
+}
+
+fn partition_distribution_table(distribution: Option<&CurrentTablePartitionDistribution>) -> Table {
+    Table {
+        columns: vec![
+            Cell::text("Percentile"),
+            Cell::text("Files"),
+            Cell::text("Binary size"),
+        ],
+        rows: vec![
+            partition_distribution_row(
+                "min",
+                distribution.map(|distribution| distribution.files.min),
+                distribution.map(|distribution| distribution.total_size_bytes.min),
+            ),
+            partition_distribution_row(
+                "p25",
+                distribution.map(|distribution| distribution.files.p25),
+                distribution.map(|distribution| distribution.total_size_bytes.p25),
+            ),
+            partition_distribution_row(
+                "p50",
+                distribution.map(|distribution| distribution.files.p50),
+                distribution.map(|distribution| distribution.total_size_bytes.p50),
+            ),
+            partition_distribution_row(
+                "p75",
+                distribution.map(|distribution| distribution.files.p75),
+                distribution.map(|distribution| distribution.total_size_bytes.p75),
+            ),
+            partition_distribution_row(
+                "p90",
+                distribution.map(|distribution| distribution.files.p90),
+                distribution.map(|distribution| distribution.total_size_bytes.p90),
+            ),
+            partition_distribution_row(
+                "p95",
+                distribution.map(|distribution| distribution.files.p95),
+                distribution.map(|distribution| distribution.total_size_bytes.p95),
+            ),
+            partition_distribution_row(
+                "p99",
+                distribution.map(|distribution| distribution.files.p99),
+                distribution.map(|distribution| distribution.total_size_bytes.p99),
+            ),
+            partition_distribution_row(
+                "max",
+                distribution.map(|distribution| distribution.files.max),
+                distribution.map(|distribution| distribution.total_size_bytes.max),
+            ),
+        ],
+    }
+}
+
+fn partition_distribution_row(
+    label: &str,
+    file_count: Option<u64>,
+    size_bytes: Option<u64>,
+) -> Row {
+    let file_count = file_count.map_or_else(
+        || Cell::text("n/a"),
+        |count| Cell::value(DocumentValue::Unsigned(count)),
+    );
+    let size = size_bytes.map_or_else(
+        || Cell::text("n/a"),
+        |size| Cell::value(DocumentValue::Bytes(size)),
+    );
+    Row {
+        cells: vec![Cell::text(label), file_count, size],
     }
 }
 
@@ -2072,11 +2181,12 @@ mod tests {
 
     use crate::engine::{
         BoundPrecision, CurrentDataFileSizeStats, CurrentManifestFileDetail,
-        CurrentManifestFileList, CurrentTableMax, CurrentTablePartitionStats,
-        CurrentTablePartitions, CurrentTableProperties, CurrentTableStats, DataFileSizeBucketStats,
-        DataFileSizeDistribution, DeleteAnalysisCompleteness, DeleteImpact,
-        ManifestColumnMetadataSummary, ManifestFileListEntry, ManifestPartitionMetadataSummary,
-        MaxConfidence, ReadCompleteness, TablePropertyEntry, TypeCompatibility,
+        CurrentManifestFileList, CurrentTableMax, CurrentTablePartitionDistribution,
+        CurrentTablePartitionStats, CurrentTablePartitions, CurrentTableProperties,
+        CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
+        DeleteAnalysisCompleteness, DeleteImpact, ManifestColumnMetadataSummary,
+        ManifestFileListEntry, ManifestPartitionMetadataSummary, MaxConfidence,
+        PartitionMetricDistribution, ReadCompleteness, TablePropertyEntry, TypeCompatibility,
     };
     use crate::spec::{
         FormatVersion, ListType, ManifestContentType, ManifestFile, MapType, NestedField,
@@ -3228,6 +3338,28 @@ mod tests {
                     },
                 ],
             }],
+            partition_distribution: Some(CurrentTablePartitionDistribution {
+                files: PartitionMetricDistribution {
+                    min: 5,
+                    p25: 10,
+                    p50: 20,
+                    p75: 30,
+                    p90: 40,
+                    p95: 50,
+                    p99: 60,
+                    max: 70,
+                },
+                total_size_bytes: PartitionMetricDistribution {
+                    min: 1_024,
+                    p25: 2_048,
+                    p50: 3_072,
+                    p75: 4_096,
+                    p90: 5_120,
+                    p95: 6_144,
+                    p99: 7_168,
+                    max: 8_192,
+                },
+            }),
         };
 
         let document = table_partitions_document(
@@ -3301,8 +3433,84 @@ mod tests {
             Cell::value(DocumentValue::Count(1)),
             partition_properties[0].value
         );
+        assert_eq!("Files per partition", partition_properties[2].label);
+        assert_eq!(Cell::code("3.00"), partition_properties[2].value);
+        assert_eq!("Data per partition", partition_properties[3].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Bytes(900)),
+            partition_properties[3].value
+        );
 
-        let Block::Table(partitions_table) = &partitions_section.blocks[2] else {
+        let Block::Section(partition_distribution_section) = &partitions_section.blocks[1] else {
+            panic!("partitions section should contain partition distribution section");
+        };
+        assert_eq!(
+            Cell::text("Partition distribution"),
+            partition_distribution_section.title
+        );
+        let Block::Table(partition_distribution_table) = &partition_distribution_section.blocks[0]
+        else {
+            panic!("partition distribution section should contain a table");
+        };
+        assert_eq!(
+            vec![
+                Cell::text("Percentile"),
+                Cell::text("Files"),
+                Cell::text("Binary size")
+            ],
+            partition_distribution_table.columns
+        );
+        assert_eq!(
+            vec![
+                vec![
+                    Cell::text("min"),
+                    Cell::value(DocumentValue::Unsigned(5)),
+                    Cell::value(DocumentValue::Bytes(1_024))
+                ],
+                vec![
+                    Cell::text("p25"),
+                    Cell::value(DocumentValue::Unsigned(10)),
+                    Cell::value(DocumentValue::Bytes(2_048))
+                ],
+                vec![
+                    Cell::text("p50"),
+                    Cell::value(DocumentValue::Unsigned(20)),
+                    Cell::value(DocumentValue::Bytes(3_072))
+                ],
+                vec![
+                    Cell::text("p75"),
+                    Cell::value(DocumentValue::Unsigned(30)),
+                    Cell::value(DocumentValue::Bytes(4_096))
+                ],
+                vec![
+                    Cell::text("p90"),
+                    Cell::value(DocumentValue::Unsigned(40)),
+                    Cell::value(DocumentValue::Bytes(5_120))
+                ],
+                vec![
+                    Cell::text("p95"),
+                    Cell::value(DocumentValue::Unsigned(50)),
+                    Cell::value(DocumentValue::Bytes(6_144))
+                ],
+                vec![
+                    Cell::text("p99"),
+                    Cell::value(DocumentValue::Unsigned(60)),
+                    Cell::value(DocumentValue::Bytes(7_168))
+                ],
+                vec![
+                    Cell::text("max"),
+                    Cell::value(DocumentValue::Unsigned(70)),
+                    Cell::value(DocumentValue::Bytes(8_192))
+                ],
+            ],
+            partition_distribution_table
+                .rows
+                .iter()
+                .map(|row| row.cells.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let Block::Table(partitions_table) = &partitions_section.blocks[3] else {
             panic!("partitions section should contain a table");
         };
         assert_eq!(

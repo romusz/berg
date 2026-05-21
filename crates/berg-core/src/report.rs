@@ -18,7 +18,8 @@ use std::borrow::Borrow;
 use std::collections::HashSet;
 
 use crate::document::{
-    Block, Cell, Document, DocumentValue, List, ListItem, ListKind, Property, Row, Section, Table,
+    Block, Cell, DeltaDirection, Document, DocumentValue, List, ListItem, ListKind, Property, Row,
+    Section, Table, UnknownValueKind,
 };
 use crate::engine::{
     BoundPrecision, CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
@@ -26,7 +27,8 @@ use crate::engine::{
     CurrentTablePartitions, CurrentTableProperties, CurrentTableStats, DataFileSizeBucketStats,
     DataFileSizeDistribution, DeleteAnalysisCompleteness, DeleteImpact,
     ManifestColumnMetadataSummary, ManifestFileListEntry, ManifestPartitionMetadataSummary,
-    MaxConfidence, ReadCompleteness, TablePropertyEntry, TypeCompatibility,
+    MaxConfidence, ReadCompleteness, TablePropertyEntry, TableSnapshotList, TableSnapshotListEntry,
+    TypeCompatibility,
 };
 use crate::spec::{ManifestFile, NestedFieldRef, PartitionSpec, Schema, Type};
 use time::OffsetDateTime;
@@ -175,6 +177,35 @@ pub fn table_properties_document(
             Block::Section(Section {
                 title: Cell::text("Properties"),
                 blocks: table_property_blocks(&properties.properties),
+            }),
+        ],
+    }
+}
+
+/// Build a document from snapshots retained in the current table metadata.
+#[must_use]
+pub fn table_snapshot_list_document(
+    table_ident: impl Into<String>,
+    source_endpoint: impl Into<String>,
+    retrieved_at: OffsetDateTime,
+    snapshots: &TableSnapshotList,
+) -> Document {
+    let table_ident = table_ident.into();
+
+    Document {
+        title: Cell::new(vec![
+            DocumentValue::Text("Table Snapshots: ".to_string()),
+            DocumentValue::Code(table_ident),
+        ]),
+        blocks: vec![
+            Block::Properties(table_snapshot_list_header_properties(
+                source_endpoint.into(),
+                retrieved_at,
+                snapshots,
+            )),
+            Block::Section(Section {
+                title: Cell::text("Snapshots"),
+                blocks: table_snapshot_list_blocks(snapshots),
             }),
         ],
     }
@@ -855,6 +886,22 @@ fn ratio_count_cell(numerator: usize, denominator: usize) -> Cell {
     ])
 }
 
+fn missing_value_cell() -> Cell {
+    Cell::value(DocumentValue::MissingValue)
+}
+
+fn unknown_numeric_cell() -> Cell {
+    Cell::value(DocumentValue::UnknownValue {
+        kind: UnknownValueKind::Numeric,
+    })
+}
+
+fn unknown_generic_cell() -> Cell {
+    Cell::value(DocumentValue::UnknownValue {
+        kind: UnknownValueKind::Generic,
+    })
+}
+
 fn optional_i64_range_cell(min: Option<i64>, max: Option<i64>) -> Cell {
     match (min, max) {
         (Some(min), Some(max)) if min == max => Cell::value(DocumentValue::Number(min)),
@@ -863,7 +910,7 @@ fn optional_i64_range_cell(min: Option<i64>, max: Option<i64>) -> Cell {
             DocumentValue::Text("..".to_string()),
             DocumentValue::Number(max),
         ]),
-        _ => Cell::code("n/a"),
+        _ => missing_value_cell(),
     }
 }
 
@@ -1036,10 +1083,9 @@ fn partition_metadata_row(metadata: &ManifestPartitionMetadataSummary) -> Row {
     Row {
         cells: vec![
             Cell::code(metadata.field_name.clone()),
-            metadata.field_id.map_or_else(
-                || Cell::text("unknown"),
-                |id| Cell::value(DocumentValue::Number(i64::from(id))),
-            ),
+            metadata.field_id.map_or_else(unknown_numeric_cell, |id| {
+                Cell::value(DocumentValue::Number(i64::from(id)))
+            }),
             separated_code_cell(partition_metadata_names(metadata)),
         ],
     }
@@ -1258,7 +1304,7 @@ fn partition_summary_properties(stats: &CurrentTablePartitions) -> Vec<Property>
 
 fn files_per_partition_cell(data_file_count: u64, partition_count: usize) -> Cell {
     files_per_partition_value(data_file_count, partition_count)
-        .map_or_else(|| Cell::text("n/a"), Cell::code)
+        .map_or_else(missing_value_cell, Cell::code)
 }
 
 fn files_per_partition_value(data_file_count: u64, partition_count: usize) -> Option<String> {
@@ -1300,7 +1346,7 @@ fn partition_spec_table(schema: &Schema, partition_spec: &PartitionSpec) -> Tabl
                 cells: vec![
                     Cell::code(field.name.clone()),
                     Cell::code(source_field_name(schema, field.source_id)),
-                    Cell::code(source_field_type(schema, field.source_id)),
+                    source_field_type_cell(schema, field.source_id),
                     Cell::code(field.transform.to_string()),
                     Cell::value(DocumentValue::Number(i64::from(field.source_id))),
                     Cell::value(DocumentValue::Number(i64::from(field.field_id))),
@@ -1316,11 +1362,12 @@ fn source_field_name(schema: &Schema, source_id: i32) -> String {
         .map_or_else(|| format!("<unknown:{source_id}>"), ToString::to_string)
 }
 
-fn source_field_type(schema: &Schema, source_id: i32) -> String {
-    schema.field_by_id(source_id).map_or_else(
-        || "unknown".to_string(),
-        |field| type_summary(&field.field_type),
-    )
+fn source_field_type_cell(schema: &Schema, source_id: i32) -> Cell {
+    schema
+        .field_by_id(source_id)
+        .map_or_else(unknown_generic_cell, |field| {
+            Cell::code(type_summary(&field.field_type))
+        })
 }
 
 fn partition_stats_table(stats: &CurrentTablePartitions) -> Table {
@@ -1518,14 +1565,12 @@ fn partition_distribution_row(
     file_count: Option<u64>,
     size_bytes: Option<u64>,
 ) -> Row {
-    let file_count = file_count.map_or_else(
-        || Cell::text("n/a"),
-        |count| Cell::value(DocumentValue::Unsigned(count)),
-    );
-    let size = size_bytes.map_or_else(
-        || Cell::text("n/a"),
-        |size| Cell::value(DocumentValue::Bytes(size)),
-    );
+    let file_count = file_count.map_or_else(missing_value_cell, |count| {
+        Cell::value(DocumentValue::Unsigned(count))
+    });
+    let size = size_bytes.map_or_else(missing_value_cell, |size| {
+        Cell::value(DocumentValue::Bytes(size))
+    });
     Row {
         cells: vec![Cell::text(label), file_count, size],
     }
@@ -1561,31 +1606,27 @@ fn data_file_size_bucket_row(bucket: &DataFileSizeBucketStats) -> Row {
 }
 
 fn optional_bytes_cell(size_bytes: Option<u64>) -> Cell {
-    size_bytes.map_or_else(
-        || Cell::text("n/a"),
-        |size| Cell::value(DocumentValue::Bytes(size)),
-    )
+    size_bytes.map_or_else(missing_value_cell, |size| {
+        Cell::value(DocumentValue::Bytes(size))
+    })
 }
 
 fn optional_u32_cell(value: Option<u32>) -> Cell {
-    value.map_or_else(
-        || Cell::text("unknown"),
-        |value| Cell::value(DocumentValue::Unsigned(u64::from(value))),
-    )
+    value.map_or_else(unknown_numeric_cell, |value| {
+        Cell::value(DocumentValue::Unsigned(u64::from(value)))
+    })
 }
 
 fn optional_u64_cell(value: Option<u64>) -> Cell {
-    value.map_or_else(
-        || Cell::text("unknown"),
-        |value| Cell::value(DocumentValue::Unsigned(value)),
-    )
+    value.map_or_else(unknown_numeric_cell, |value| {
+        Cell::value(DocumentValue::Unsigned(value))
+    })
 }
 
 fn optional_usize_cell(value: Option<usize>) -> Cell {
-    value.map_or_else(
-        || Cell::text("unknown"),
-        |value| Cell::value(DocumentValue::Count(value)),
-    )
+    value.map_or_else(unknown_numeric_cell, |value| {
+        Cell::value(DocumentValue::Count(value))
+    })
 }
 
 fn table_stats_header_properties(
@@ -1686,6 +1727,299 @@ fn table_properties_header_properties(
     ]
 }
 
+fn table_snapshot_list_header_properties(
+    source_endpoint: String,
+    retrieved_at: OffsetDateTime,
+    snapshots: &TableSnapshotList,
+) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Source endpoint".to_string(),
+            value: Cell::value(DocumentValue::Uri(source_endpoint)),
+        },
+        Property {
+            label: "Retrieved at".to_string(),
+            value: utc_and_local_timestamp_cell(retrieved_at),
+        },
+        Property {
+            label: "Metadata".to_string(),
+            value: Cell::value(DocumentValue::Uri(snapshots.metadata_json_path.clone())),
+        },
+        Property {
+            label: "Last updated at".to_string(),
+            value: utc_and_local_timestamp_cell(snapshots.last_updated_at),
+        },
+        Property {
+            label: "Current snapshot ID".to_string(),
+            value: optional_i64_or_missing_cell(snapshots.current_snapshot_id),
+        },
+        Property {
+            label: "Snapshots in metadata JSON".to_string(),
+            value: Cell::value(DocumentValue::Count(snapshots.snapshots.len())),
+        },
+        Property {
+            label: "Snapshot log entries".to_string(),
+            value: Cell::value(DocumentValue::Count(snapshots.snapshot_log_entry_count)),
+        },
+    ]
+}
+
+fn table_snapshot_list_blocks(snapshots: &TableSnapshotList) -> Vec<Block> {
+    if snapshots.snapshots.is_empty() {
+        return vec![Block::Paragraph(Cell::text("No snapshots found."))];
+    }
+
+    let record_widths = summary_metric_widths(snapshots.snapshots.iter().map(|snapshot| {
+        (
+            snapshot.added_records,
+            snapshot.deleted_records,
+            snapshot.total_records,
+        )
+    }));
+    let data_file_widths = summary_metric_widths(snapshots.snapshots.iter().map(|snapshot| {
+        (
+            snapshot.added_data_files,
+            snapshot.deleted_data_files,
+            snapshot.total_data_files,
+        )
+    }));
+    let delete_file_widths = summary_metric_widths(snapshots.snapshots.iter().map(|snapshot| {
+        (
+            snapshot.added_delete_files,
+            snapshot.removed_delete_files,
+            snapshot.total_delete_files,
+        )
+    }));
+
+    vec![Block::Table(Table {
+        columns: vec![
+            Cell::text("Committed at"),
+            Cell::text("Snapshot ID"),
+            Cell::text("Operation"),
+            Cell::text("Records"),
+            Cell::text("Data Files"),
+            Cell::text("Delete Files"),
+            Cell::text("Size"),
+            Cell::text("Δ Partitions"),
+        ],
+        rows: snapshots
+            .snapshots
+            .iter()
+            .map(|snapshot| {
+                table_snapshot_list_row(
+                    snapshot,
+                    snapshots.current_snapshot_id == Some(snapshot.snapshot_id),
+                    record_widths,
+                    data_file_widths,
+                    delete_file_widths,
+                )
+            })
+            .collect(),
+    })]
+}
+
+fn table_snapshot_list_row(
+    snapshot: &TableSnapshotListEntry,
+    is_current: bool,
+    record_widths: SummaryMetricWidths,
+    data_file_widths: SummaryMetricWidths,
+    delete_file_widths: SummaryMetricWidths,
+) -> Row {
+    Row {
+        cells: vec![
+            Cell::value(DocumentValue::Timestamp(snapshot.committed_at)),
+            snapshot_id_cell(snapshot.snapshot_id, is_current),
+            Cell::code(snapshot.operation.clone()),
+            snapshot_summary_metric_cell(
+                snapshot.added_records,
+                snapshot.deleted_records,
+                snapshot.total_records,
+                record_widths,
+            ),
+            snapshot_summary_metric_cell(
+                snapshot.added_data_files,
+                snapshot.deleted_data_files,
+                snapshot.total_data_files,
+                data_file_widths,
+            ),
+            snapshot_summary_metric_cell(
+                snapshot.added_delete_files,
+                snapshot.removed_delete_files,
+                snapshot.total_delete_files,
+                delete_file_widths,
+            ),
+            optional_bytes_or_missing_cell(snapshot.total_file_size_bytes),
+            optional_u64_or_missing_cell(snapshot.changed_partition_count),
+        ],
+    }
+}
+
+fn snapshot_id_cell(snapshot_id: i64, is_current: bool) -> Cell {
+    let mut values = vec![DocumentValue::Code(snapshot_id.to_string())];
+
+    if is_current {
+        values.push(DocumentValue::Text(" ✓".to_string()));
+    }
+
+    Cell::new(values)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SummaryMetricWidths {
+    added: usize,
+    removed: usize,
+    total: usize,
+}
+
+fn summary_metric_widths(
+    metrics: impl IntoIterator<Item = (Option<u64>, Option<u64>, Option<u64>)>,
+) -> SummaryMetricWidths {
+    metrics
+        .into_iter()
+        .map(|(added, removed, total)| SummaryMetricWidths {
+            added: summary_delta_value_len(added, DeltaDirection::Positive),
+            removed: summary_delta_value_len(removed, DeltaDirection::Negative),
+            total: optional_summary_value(total).len(),
+        })
+        .fold(
+            SummaryMetricWidths {
+                added: 0,
+                removed: 0,
+                total: 0,
+            },
+            |left, right| SummaryMetricWidths {
+                added: left.added.max(right.added),
+                removed: left.removed.max(right.removed),
+                total: left.total.max(right.total),
+            },
+        )
+}
+
+fn snapshot_summary_metric_cell(
+    added: Option<u64>,
+    removed: Option<u64>,
+    total: Option<u64>,
+    widths: SummaryMetricWidths,
+) -> Cell {
+    let mut values = Vec::new();
+
+    push_summary_delta_value(&mut values, added, DeltaDirection::Positive, widths.added);
+    push_text(&mut values, " ");
+    push_summary_delta_value(
+        &mut values,
+        removed,
+        DeltaDirection::Negative,
+        widths.removed,
+    );
+    push_text(&mut values, " ");
+    push_optional_summary_value(&mut values, total, widths.total);
+
+    Cell::new(values)
+}
+
+fn summary_delta_value_len(value: Option<u64>, direction: DeltaDirection) -> usize {
+    summary_delta_value(value, direction).len()
+}
+
+fn push_summary_delta_value(
+    values: &mut Vec<DocumentValue>,
+    value: Option<u64>,
+    direction: DeltaDirection,
+    width: usize,
+) {
+    values.push(DocumentValue::Delta { direction, value });
+    push_padding(
+        values,
+        width.saturating_sub(summary_delta_value_len(value, direction)),
+    );
+}
+
+fn push_optional_summary_value(values: &mut Vec<DocumentValue>, value: Option<u64>, width: usize) {
+    match value {
+        Some(value) => push_right_padded_code(values, grouped_u64(value), width),
+        None => push_right_padded_missing_value(values, width),
+    }
+}
+
+fn push_right_padded_code(values: &mut Vec<DocumentValue>, value: String, width: usize) {
+    push_padding(values, width.saturating_sub(value.len()));
+    values.push(DocumentValue::Code(value));
+}
+
+fn push_right_padded_missing_value(values: &mut Vec<DocumentValue>, width: usize) {
+    push_padding(values, width.saturating_sub(1));
+    values.push(DocumentValue::MissingValue);
+}
+
+fn push_padding(values: &mut Vec<DocumentValue>, width: usize) {
+    if width > 0 {
+        push_text(values, " ".repeat(width));
+    }
+}
+
+fn push_text(values: &mut Vec<DocumentValue>, text: impl Into<String>) {
+    let text = text.into();
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(DocumentValue::Text(existing)) = values.last_mut() {
+        existing.push_str(&text);
+    } else {
+        values.push(DocumentValue::Text(text));
+    }
+}
+
+fn summary_delta_value(value: Option<u64>, direction: DeltaDirection) -> String {
+    let sign = match direction {
+        DeltaDirection::Positive => '+',
+        DeltaDirection::Negative => '-',
+    };
+
+    format!("{sign}{}", grouped_u64(value.unwrap_or(0)))
+}
+
+fn optional_summary_value(value: Option<u64>) -> String {
+    value.map_or_else(|| "?".to_string(), grouped_u64)
+}
+
+fn grouped_u64(value: u64) -> String {
+    let digits = value.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (index, digit) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            formatted.push(',');
+        }
+
+        formatted.push(digit);
+    }
+
+    formatted.chars().rev().collect()
+}
+
+fn optional_i64_or_missing_cell(value: Option<i64>) -> Cell {
+    value.map_or_else(
+        || Cell::value(DocumentValue::MissingValue),
+        |value| Cell::value(DocumentValue::Number(value)),
+    )
+}
+
+fn optional_u64_or_missing_cell(value: Option<u64>) -> Cell {
+    Cell::value(optional_u64_or_missing_value(value))
+}
+
+fn optional_u64_or_missing_value(value: Option<u64>) -> DocumentValue {
+    value.map_or(DocumentValue::MissingValue, DocumentValue::Unsigned)
+}
+
+fn optional_bytes_or_missing_cell(value: Option<u64>) -> Cell {
+    value.map_or_else(
+        || Cell::value(DocumentValue::MissingValue),
+        |value| Cell::value(DocumentValue::Bytes(value)),
+    )
+}
+
 fn table_property_blocks(properties: &[TablePropertyEntry]) -> Vec<Block> {
     if properties.is_empty() {
         return vec![Block::Paragraph(Cell::text("No table properties found."))];
@@ -1710,10 +2044,9 @@ fn table_property_row(property: &TablePropertyEntry) -> Row {
 }
 
 fn optional_snapshot_id_cell(snapshot_id: Option<i64>) -> Cell {
-    snapshot_id.map_or_else(
-        || Cell::code("n/a"),
-        |id| Cell::value(DocumentValue::Number(id)),
-    )
+    snapshot_id.map_or_else(missing_value_cell, |id| {
+        Cell::value(DocumentValue::Number(id))
+    })
 }
 
 fn table_file_properties(stats: &CurrentTableStats) -> Vec<Property> {
@@ -1817,7 +2150,7 @@ fn metadata_json_uncompressed_size_cell(stats: &CurrentTableStats) -> Cell {
 fn metadata_overhead_cell(total_metadata_size: u64, total_table_file_size: u64) -> Cell {
     let Some(percentage_millis) = percentage_millis(total_metadata_size, total_table_file_size)
     else {
-        return Cell::text("n/a");
+        return missing_value_cell();
     };
 
     Cell::new(vec![
@@ -1988,7 +2321,8 @@ mod tests {
         CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
         DeleteAnalysisCompleteness, DeleteImpact, ManifestColumnMetadataSummary,
         ManifestFileListEntry, ManifestPartitionMetadataSummary, MaxConfidence,
-        PartitionMetricDistribution, ReadCompleteness, TablePropertyEntry, TypeCompatibility,
+        PartitionMetricDistribution, ReadCompleteness, TablePropertyEntry, TableSnapshotList,
+        TableSnapshotListEntry, TypeCompatibility,
     };
     use crate::spec::{
         FormatVersion, ListType, ManifestContentType, ManifestFile, MapType, NestedField,
@@ -1997,9 +2331,10 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        Block, Cell, DocumentValue, data_file_size_stats_document, manifest_file_detail_document,
-        manifest_file_list_document, schema_document, table_data_max_document,
-        table_partitions_document, table_properties_document, table_stats_document,
+        Block, Cell, DeltaDirection, DocumentValue, data_file_size_stats_document,
+        manifest_file_detail_document, manifest_file_list_document, schema_document,
+        table_data_max_document, table_partitions_document, table_properties_document,
+        table_snapshot_list_document, table_stats_document,
     };
 
     fn nested_schema() -> Schema {
@@ -2499,7 +2834,10 @@ mod tests {
             panic!("first block should be properties");
         };
         assert_eq!("Current snapshot ID", header_properties[7].label);
-        assert_eq!(Cell::code("n/a"), header_properties[7].value);
+        assert_eq!(
+            Cell::value(DocumentValue::MissingValue),
+            header_properties[7].value
+        );
         assert_eq!("Properties", header_properties[11].label);
         assert_eq!(
             Cell::value(DocumentValue::Count(0)),
@@ -2513,6 +2851,149 @@ mod tests {
         assert_eq!(
             Block::Paragraph(Cell::text("No table properties found.")),
             section.blocks[0]
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "document shape assertions are intentionally explicit"
+    )]
+    fn builds_table_snapshot_list_document() {
+        let snapshots = TableSnapshotList {
+            metadata_json_path: "s3://warehouse/table/metadata/00042.gz.metadata.json".to_string(),
+            last_updated_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
+                .expect("valid timestamp"),
+            current_snapshot_id: Some(42),
+            snapshot_log_entry_count: 3,
+            snapshots: vec![
+                TableSnapshotListEntry {
+                    snapshot_id: 42,
+                    committed_at: OffsetDateTime::from_unix_timestamp(1_777_999_300)
+                        .expect("valid timestamp"),
+                    operation: "append".to_string(),
+                    added_records: Some(100),
+                    deleted_records: Some(0),
+                    total_records: Some(900),
+                    added_data_files: Some(4),
+                    deleted_data_files: Some(0),
+                    total_data_files: Some(12),
+                    added_delete_files: Some(0),
+                    removed_delete_files: Some(0),
+                    total_delete_files: Some(1),
+                    total_file_size_bytes: Some(2048),
+                    changed_partition_count: Some(2),
+                },
+                TableSnapshotListEntry {
+                    snapshot_id: 41,
+                    committed_at: OffsetDateTime::from_unix_timestamp(1_777_999_200)
+                        .expect("valid timestamp"),
+                    operation: "replace".to_string(),
+                    added_records: None,
+                    deleted_records: None,
+                    total_records: Some(800),
+                    added_data_files: Some(8),
+                    deleted_data_files: Some(6),
+                    total_data_files: Some(8),
+                    added_delete_files: None,
+                    removed_delete_files: None,
+                    total_delete_files: None,
+                    total_file_size_bytes: None,
+                    changed_partition_count: None,
+                },
+            ],
+        };
+
+        let document = table_snapshot_list_document(
+            "lakehouse.redapl_v3.k8s_pod_blue",
+            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
+            &snapshots,
+        );
+
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Text("Table Snapshots: ".to_string()),
+                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+            ]),
+            document.title
+        );
+
+        let Block::Properties(header_properties) = &document.blocks[0] else {
+            panic!("first block should be properties");
+        };
+        assert_eq!("Current snapshot ID", header_properties[4].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Number(42)),
+            header_properties[4].value
+        );
+        assert_eq!("Snapshots in metadata JSON", header_properties[5].label);
+        assert_eq!(
+            Cell::value(DocumentValue::Count(2)),
+            header_properties[5].value
+        );
+
+        let Block::Section(section) = &document.blocks[1] else {
+            panic!("second block should be snapshots section");
+        };
+        let Block::Table(table) = &section.blocks[0] else {
+            panic!("snapshots section should contain a table");
+        };
+        assert_eq!(
+            vec![
+                Cell::text("Committed at"),
+                Cell::text("Snapshot ID"),
+                Cell::text("Operation"),
+                Cell::text("Records"),
+                Cell::text("Data Files"),
+                Cell::text("Delete Files"),
+                Cell::text("Size"),
+                Cell::text("Δ Partitions"),
+            ],
+            table.columns
+        );
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Code("42".to_string()),
+                DocumentValue::Text(" ✓".to_string())
+            ]),
+            table.rows[0].cells[1]
+        );
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Delta {
+                    direction: DeltaDirection::Positive,
+                    value: Some(100),
+                },
+                DocumentValue::Text(" ".to_string()),
+                DocumentValue::Delta {
+                    direction: DeltaDirection::Negative,
+                    value: Some(0),
+                },
+                DocumentValue::Text(" ".to_string()),
+                DocumentValue::Code("900".to_string()),
+            ]),
+            table.rows[0].cells[3]
+        );
+        assert_eq!(
+            Cell::value(DocumentValue::MissingValue),
+            table.rows[1].cells[6]
+        );
+        assert_eq!(
+            Cell::new(vec![
+                DocumentValue::Delta {
+                    direction: DeltaDirection::Positive,
+                    value: None,
+                },
+                DocumentValue::Text("   ".to_string()),
+                DocumentValue::Delta {
+                    direction: DeltaDirection::Negative,
+                    value: None,
+                },
+                DocumentValue::Text(" ".to_string()),
+                DocumentValue::Code("800".to_string()),
+            ]),
+            table.rows[1].cells[3]
         );
     }
 

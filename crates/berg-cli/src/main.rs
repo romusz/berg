@@ -4,17 +4,20 @@ use std::ffi::OsString;
 use std::fmt::Write;
 
 use anyhow::{Context, anyhow};
-use berg_core::document::{Block, Cell, Document, DocumentValue, List, ListKind, Row, Table};
+use berg_core::document::{
+    Block, Cell, DeltaDirection, Document, DocumentValue, List, ListKind, Row, Table,
+    UnknownValueKind,
+};
 use berg_core::engine::{
     QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats,
     load_current_manifest_file_detail, load_current_manifest_file_list, load_current_schema,
     load_current_table_max, load_current_table_partitions, load_current_table_properties,
-    load_current_table_stats, parse_catalog_property,
+    load_current_table_stats, load_table_snapshot_list, parse_catalog_property,
 };
 use berg_core::report::{
     data_file_size_stats_document, manifest_file_detail_document, manifest_file_list_document,
     schema_document, table_data_max_document, table_partitions_document, table_properties_document,
-    table_stats_document,
+    table_snapshot_list_document, table_stats_document,
 };
 use clap::error::ErrorKind;
 use clap::{ArgAction, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -151,6 +154,8 @@ enum TableCommands {
     Properties(TablePropertiesArgs),
     /// Inspect table schemas.
     Schema(TableSchemaArgs),
+    /// Inspect table snapshots.
+    Snapshots(TableSnapshotsArgs),
     /// Inspect table statistics.
     Stats(TableStatsArgs),
 }
@@ -305,6 +310,28 @@ struct TableStatsArgs {
     command: TableStatsCommands,
 }
 
+#[derive(Debug, Args)]
+struct TableSnapshotsArgs {
+    #[command(subcommand)]
+    command: TableSnapshotsCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum TableSnapshotsCommands {
+    /// List snapshots retained in the current table metadata.
+    List(TableSnapshotListArgs),
+}
+
+#[derive(Debug, Args)]
+struct TableSnapshotListArgs {
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
+    table: String,
+
+    #[command(flatten)]
+    output: DocumentOutputArgs,
+}
+
 #[derive(Debug, Subcommand)]
 enum TableStatsCommands {
     /// Show statistics for the current snapshot.
@@ -413,6 +440,11 @@ async fn main() -> anyhow::Result<()> {
             TableCommands::Schema(schema_args) => match schema_args.command {
                 TableSchemaCommands::Current(args) => {
                     print_current_schema(args, catalog_args).await?;
+                }
+            },
+            TableCommands::Snapshots(snapshots_args) => match snapshots_args.command {
+                TableSnapshotsCommands::List(args) => {
+                    print_table_snapshot_list(args, catalog_args).await?;
                 }
             },
             TableCommands::Stats(stats_args) => match stats_args.command {
@@ -655,6 +687,33 @@ async fn print_current_table_properties(
         config.table_endpoint(table.table()),
         OffsetDateTime::now_utc(),
         &properties,
+    );
+
+    print!("{}", render_document(&document, args.output.format)?);
+
+    Ok(())
+}
+
+async fn print_table_snapshot_list(
+    args: TableSnapshotListArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<()> {
+    let table = QualifiedTableIdent::parse(&args.table)?;
+    let config = rest_catalog_config(catalog_args, &table)?;
+
+    let snapshots = load_table_snapshot_list(&config, table.table())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load table snapshots for `{}`",
+                table.display_name()
+            )
+        })?;
+    let document = table_snapshot_list_document(
+        table.display_name(),
+        config.table_endpoint(table.table()),
+        OffsetDateTime::now_utc(),
+        &snapshots,
     );
 
     print!("{}", render_document(&document, args.output.format)?);
@@ -1000,13 +1059,6 @@ fn render_blocks_markdown(blocks: &[Block], heading_level: usize, markdown: &mut
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MarkdownTableColumn {
-    Source(usize),
-    Bytes(usize),
-    BinarySize(usize),
-}
-
 fn render_table_markdown(table: &Table, markdown: &mut String) {
     let columns = markdown_table_columns(table);
     let headers = columns
@@ -1030,11 +1082,20 @@ fn render_table_markdown(table: &Table, markdown: &mut String) {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MarkdownTableColumn {
+    Source(usize),
+    Bytes(usize),
+    BinarySize(usize),
+}
+
 fn markdown_table_columns(table: &Table) -> Vec<MarkdownTableColumn> {
     let mut columns = Vec::new();
 
     for index in 0..table.columns.len() {
         if is_bytes_table_column(table, index) {
+            // Keep exact bytes visible for copy/paste and audits. Binary sizes are easier
+            // to scan, but they must not replace the canonical byte count.
             if is_binary_size_table_column(table, index) {
                 columns.push(MarkdownTableColumn::BinarySize(index));
             } else {
@@ -1180,17 +1241,19 @@ fn is_right_aligned_table_column(table: &Table, column_index: usize) -> bool {
 }
 
 fn is_numeric_table_cell(cell: &Cell) -> bool {
-    match cell.values.as_slice() {
-        [
-            DocumentValue::Number(_)
+    matches!(
+        cell.values.as_slice(),
+        [DocumentValue::Number(_)
             | DocumentValue::Unsigned(_)
             | DocumentValue::Bytes(_)
+            | DocumentValue::Delta { .. }
             | DocumentValue::PercentageMillis(_)
-            | DocumentValue::Count(_),
-        ] => true,
-        [DocumentValue::Text(value)] if value == "n/a" => true,
-        _ => false,
-    }
+            | DocumentValue::Count(_)
+            | DocumentValue::MissingValue
+            | DocumentValue::UnknownValue {
+                kind: UnknownValueKind::Numeric,
+            },]
+    )
 }
 
 fn is_bytes_table_column(table: &Table, column_index: usize) -> bool {
@@ -1198,16 +1261,33 @@ fn is_bytes_table_column(table: &Table, column_index: usize) -> bool {
         && table.rows.iter().all(|row| {
             row.cells
                 .get(column_index)
-                .is_some_and(is_bytes_or_na_table_cell)
+                .is_some_and(is_bytes_or_missing_table_cell)
         })
+        && (table
+            .rows
+            .iter()
+            .any(|row| row.cells.get(column_index).is_some_and(is_bytes_table_cell))
+            || is_bytes_table_column_label(table, column_index))
 }
 
-fn is_bytes_or_na_table_cell(cell: &Cell) -> bool {
-    match cell.values.as_slice() {
-        [DocumentValue::Bytes(_)] => true,
-        [DocumentValue::Text(value)] if value == "n/a" => true,
-        _ => false,
-    }
+fn is_bytes_table_cell(cell: &Cell) -> bool {
+    matches!(cell.values.as_slice(), [DocumentValue::Bytes(_)])
+}
+
+fn is_bytes_or_missing_table_cell(cell: &Cell) -> bool {
+    matches!(
+        cell.values.as_slice(),
+        [DocumentValue::Bytes(_) | DocumentValue::MissingValue]
+    )
+}
+
+fn is_bytes_table_column_label(table: &Table, column_index: usize) -> bool {
+    table.columns.get(column_index).is_some_and(|column| {
+        matches!(
+            render_cell_markdown(column).as_str(),
+            "Size" | "Total size" | "Binary size"
+        )
+    })
 }
 
 fn is_binary_size_table_column(table: &Table, column_index: usize) -> bool {
@@ -1284,6 +1364,9 @@ fn render_document_value_markdown(value: &DocumentValue) -> String {
         DocumentValue::Number(value) => format!("`{value}`"),
         DocumentValue::Unsigned(value) => format!("`{}`", format_u64(*value)),
         DocumentValue::Bytes(value) => render_bytes_markdown(*value),
+        DocumentValue::Delta { direction, value } => render_delta_markdown(*direction, *value),
+        DocumentValue::MissingValue => "?".to_string(),
+        DocumentValue::UnknownValue { .. } => "unknown".to_string(),
         DocumentValue::PercentageMillis(value) => render_percentage_millis_markdown(*value),
         DocumentValue::Count(value) => format!("`{}`", format_usize(*value)),
         DocumentValue::Bool(value) => {
@@ -1335,6 +1418,15 @@ fn render_binary_size_markdown(value: u64) -> String {
     format!("`{scaled} {unit}`")
 }
 
+fn render_delta_markdown(direction: DeltaDirection, value: Option<u64>) -> String {
+    let sign = match direction {
+        DeltaDirection::Positive => '+',
+        DeltaDirection::Negative => '-',
+    };
+
+    format!("`{sign}{}`", format_u64(value.unwrap_or(0)))
+}
+
 fn binary_size(value: u64) -> Option<(String, &'static str)> {
     if value < 1024 {
         return None;
@@ -1342,7 +1434,7 @@ fn binary_size(value: u64) -> Option<(String, &'static str)> {
 
     let mut divisor = 1024_u128;
     let mut unit_index = 0;
-    let units = ["KiB", "MiB", "GiB", "TiB"];
+    let units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
 
     while u128::from(value) >= divisor * 1024 && unit_index < units.len() - 1 {
         divisor *= 1024;
@@ -1444,8 +1536,8 @@ mod tests {
     };
 
     use super::{
-        Cell, DocumentFormat, DocumentValue, command_tree, incomplete_command_help,
-        render_document, render_document_markdown,
+        Cell, DeltaDirection, DocumentFormat, DocumentValue, UnknownValueKind, command_tree,
+        incomplete_command_help, render_document, render_document_markdown,
     };
 
     #[test]
@@ -1560,6 +1652,39 @@ mod tests {
     }
 
     #[test]
+    fn renders_bytes_table_cells_as_exact_and_binary_columns() {
+        const ONE_PIB: u64 = 1024_u64.pow(5);
+
+        let document = Document {
+            title: Cell::text("Sizes"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![Cell::text("File"), Cell::text("Size")],
+                rows: vec![
+                    Row {
+                        cells: vec![
+                            Cell::text("a.parquet"),
+                            Cell::value(DocumentValue::Bytes(2048)),
+                        ],
+                    },
+                    Row {
+                        cells: vec![
+                            Cell::text("huge.parquet"),
+                            Cell::value(DocumentValue::Bytes(ONE_PIB)),
+                        ],
+                    },
+                ],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(markdown.contains("| File | Bytes | Binary size |"));
+        assert!(markdown.contains("| --- | ---: | ---: |"));
+        assert!(markdown.contains("| a.parquet | `2,048` | `2.000 KiB` |"));
+        assert!(markdown.contains("| huge.parquet | `1,125,899,906,842,624` | `1.000 PiB` |"));
+    }
+
+    #[test]
     fn renders_binary_size_table_cells_without_bytes_column() {
         let document = Document {
             title: Cell::text("Partition distribution"),
@@ -1577,6 +1702,83 @@ mod tests {
         assert!(markdown.contains("| --- | ---: |"));
         assert!(markdown.contains("| p50 | `2.000 KiB` |"));
         assert!(!markdown.contains("| Percentile | Bytes | Binary size |"));
+    }
+
+    #[test]
+    fn renders_missing_values_as_question_marks() {
+        let document = Document {
+            title: Cell::text("Snapshots"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![Cell::text("Value")],
+                rows: vec![Row {
+                    cells: vec![Cell::value(DocumentValue::MissingValue)],
+                }],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(markdown.contains("| ? |"));
+    }
+
+    #[test]
+    fn renders_unknown_values_as_unknown_with_typed_alignment() {
+        let document = Document {
+            title: Cell::text("Unknowns"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![Cell::text("Generic"), Cell::text("Numeric")],
+                rows: vec![Row {
+                    cells: vec![
+                        Cell::value(DocumentValue::UnknownValue {
+                            kind: UnknownValueKind::Generic,
+                        }),
+                        Cell::value(DocumentValue::UnknownValue {
+                            kind: UnknownValueKind::Numeric,
+                        }),
+                    ],
+                }],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(markdown.contains("| Generic | Numeric |"));
+        assert!(markdown.contains("| --- | ---: |"));
+        assert!(markdown.contains("| unknown | unknown |"));
+    }
+
+    #[test]
+    fn renders_delta_values_with_signs() {
+        let document = Document {
+            title: Cell::text("Delta values"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![
+                    Cell::text("Added"),
+                    Cell::text("Removed"),
+                    Cell::text("Missing"),
+                ],
+                rows: vec![Row {
+                    cells: vec![
+                        Cell::value(DocumentValue::Delta {
+                            direction: DeltaDirection::Positive,
+                            value: Some(0),
+                        }),
+                        Cell::value(DocumentValue::Delta {
+                            direction: DeltaDirection::Negative,
+                            value: Some(12),
+                        }),
+                        Cell::value(DocumentValue::Delta {
+                            direction: DeltaDirection::Positive,
+                            value: None,
+                        }),
+                    ],
+                }],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(markdown.contains("| `+0` | `-12` | `+0` |"));
     }
 
     #[test]
@@ -1690,6 +1892,12 @@ mod tests {
         );
         assert!(tree.contains("│   ├── schema - Inspect table schemas"));
         assert!(tree.contains("│   │   └── current - Show the current schema"));
+        assert!(tree.contains("│   ├── snapshots - Inspect table snapshots"));
+        assert!(
+            tree.contains(
+                "│   │   └── list - List snapshots retained in the current table metadata"
+            )
+        );
         assert!(tree.contains("│   └── stats - Inspect table statistics"));
         assert!(tree.contains("└── commands - Print the full command tree"));
     }

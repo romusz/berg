@@ -148,6 +148,24 @@ pub struct FencedCode {
     pub code: String,
 }
 
+/// Direction for a signed delta value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaDirection {
+    /// Positive/additive delta.
+    Positive,
+    /// Negative/removal delta.
+    Negative,
+}
+
+/// Category for an unknown value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownValueKind {
+    /// Unknown value with no stronger type information.
+    Generic,
+    /// Unknown numeric value.
+    Numeric,
+}
+
 /// Semantic inline value that renderers/frontends present in their own medium.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentValue {
@@ -167,6 +185,20 @@ pub enum DocumentValue {
     Unsigned(u64),
     /// Byte size value.
     Bytes(u64),
+    /// Signed delta value.
+    Delta {
+        /// Delta sign/direction.
+        direction: DeltaDirection,
+        /// Absolute delta magnitude, or missing when the source omitted it.
+        value: Option<u64>,
+    },
+    /// Missing or unavailable value.
+    MissingValue,
+    /// Value exists conceptually, but could not be determined.
+    UnknownValue {
+        /// Known category for renderer behavior such as table alignment.
+        kind: UnknownValueKind,
+    },
     /// Percentage stored as thousandths of one percent.
     PercentageMillis(u64),
     /// Non-negative count.

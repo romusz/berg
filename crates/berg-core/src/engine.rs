@@ -50,6 +50,18 @@ use crate::{BergError, Result, spec};
 // Keep compressed metadata accounting memory-bounded: range-read and decode in chunks.
 const METADATA_JSON_READ_CHUNK_SIZE_BYTES: u64 = 64 * 1024;
 
+const SUMMARY_ADDED_RECORDS: &str = "added-records";
+const SUMMARY_DELETED_RECORDS: &str = "deleted-records";
+const SUMMARY_TOTAL_RECORDS: &str = "total-records";
+const SUMMARY_ADDED_DATA_FILES: &str = "added-data-files";
+const SUMMARY_DELETED_DATA_FILES: &str = "deleted-data-files";
+const SUMMARY_TOTAL_DATA_FILES: &str = "total-data-files";
+const SUMMARY_ADDED_DELETE_FILES: &str = "added-delete-files";
+const SUMMARY_REMOVED_DELETE_FILES: &str = "removed-delete-files";
+const SUMMARY_TOTAL_DELETE_FILES: &str = "total-delete-files";
+const SUMMARY_TOTAL_FILE_SIZE: &str = "total-files-size";
+const SUMMARY_CHANGED_PARTITION_COUNT: &str = "changed-partition-count";
+
 /// A fully-qualified table identifier accepted by the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QualifiedTableIdent {
@@ -232,6 +244,54 @@ pub struct TablePropertyEntry {
     pub key: String,
     /// Property value exactly as stored in table metadata.
     pub value: String,
+}
+
+/// Metadata-only snapshot list for an Iceberg table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSnapshotList {
+    /// Current table metadata JSON location.
+    pub metadata_json_path: String,
+    /// Table metadata last update timestamp.
+    pub last_updated_at: OffsetDateTime,
+    /// Current snapshot ID, when the table has a current snapshot.
+    pub current_snapshot_id: Option<i64>,
+    /// Number of snapshot-log entries retained in the current table metadata.
+    pub snapshot_log_entry_count: usize,
+    /// Snapshots retained in the current table metadata, sorted newest first.
+    pub snapshots: Vec<TableSnapshotListEntry>,
+}
+
+/// One snapshot retained in the current table metadata JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSnapshotListEntry {
+    /// Snapshot ID.
+    pub snapshot_id: i64,
+    /// Snapshot commit/update timestamp.
+    pub committed_at: OffsetDateTime,
+    /// Snapshot operation from the summary.
+    pub operation: String,
+    /// `summary.added-records`.
+    pub added_records: Option<u64>,
+    /// `summary.deleted-records`.
+    pub deleted_records: Option<u64>,
+    /// `summary.total-records`.
+    pub total_records: Option<u64>,
+    /// `summary.added-data-files`.
+    pub added_data_files: Option<u64>,
+    /// `summary.deleted-data-files`.
+    pub deleted_data_files: Option<u64>,
+    /// `summary.total-data-files`.
+    pub total_data_files: Option<u64>,
+    /// `summary.added-delete-files`.
+    pub added_delete_files: Option<u64>,
+    /// `summary.removed-delete-files`.
+    pub removed_delete_files: Option<u64>,
+    /// `summary.total-delete-files`.
+    pub total_delete_files: Option<u64>,
+    /// `summary.total-files-size`.
+    pub total_file_size_bytes: Option<u64>,
+    /// `summary.changed-partition-count`.
+    pub changed_partition_count: Option<u64>,
 }
 
 /// Data file size statistics for the current Iceberg table snapshot.
@@ -761,6 +821,64 @@ pub async fn load_current_table_properties(
         default_partition_spec_id: metadata.default_partition_spec_id(),
         default_sort_order_id: metadata.default_sort_order_id(),
         properties,
+    })
+}
+
+/// Load snapshots retained in the current table metadata through an Iceberg REST catalog.
+///
+/// # Errors
+///
+/// Returns an Iceberg-backed error when the catalog cannot be constructed,
+/// contacted, or cannot load the requested table. Returns
+/// [`BergError::InvalidTableMetadataTimestamp`] when the table metadata update
+/// timestamp cannot be represented, and [`BergError::InvalidSnapshotTimestamp`]
+/// when a retained snapshot timestamp cannot be represented.
+pub async fn load_table_snapshot_list(
+    config: &RestCatalogConfig,
+    table_ident: &TableIdent,
+) -> Result<TableSnapshotList> {
+    let table = load_table(config, table_ident).await?;
+    let metadata = table.metadata();
+    let metadata_json_path = table.metadata_location_result()?.to_string();
+    let last_updated_at = table_metadata_updated_at(metadata.last_updated_ms())?;
+    let current_snapshot_id = metadata.current_snapshot_id();
+    let mut snapshots = metadata
+        .snapshots()
+        .map(|snapshot| {
+            let summary = snapshot.summary();
+
+            Ok(TableSnapshotListEntry {
+                snapshot_id: snapshot.snapshot_id(),
+                committed_at: snapshot_updated_at(snapshot.snapshot_id(), snapshot.timestamp_ms())?,
+                operation: summary.operation.as_str().to_string(),
+                added_records: summary_u64(summary, SUMMARY_ADDED_RECORDS),
+                deleted_records: summary_u64(summary, SUMMARY_DELETED_RECORDS),
+                total_records: summary_u64(summary, SUMMARY_TOTAL_RECORDS),
+                added_data_files: summary_u64(summary, SUMMARY_ADDED_DATA_FILES),
+                deleted_data_files: summary_u64(summary, SUMMARY_DELETED_DATA_FILES),
+                total_data_files: summary_u64(summary, SUMMARY_TOTAL_DATA_FILES),
+                added_delete_files: summary_u64(summary, SUMMARY_ADDED_DELETE_FILES),
+                removed_delete_files: summary_u64(summary, SUMMARY_REMOVED_DELETE_FILES),
+                total_delete_files: summary_u64(summary, SUMMARY_TOTAL_DELETE_FILES),
+                total_file_size_bytes: summary_u64(summary, SUMMARY_TOTAL_FILE_SIZE),
+                changed_partition_count: summary_u64(summary, SUMMARY_CHANGED_PARTITION_COUNT),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    snapshots.sort_by(|left, right| {
+        right
+            .committed_at
+            .cmp(&left.committed_at)
+            .then_with(|| right.snapshot_id.cmp(&left.snapshot_id))
+    });
+
+    Ok(TableSnapshotList {
+        metadata_json_path,
+        last_updated_at,
+        current_snapshot_id,
+        snapshot_log_entry_count: metadata.history().len(),
+        snapshots,
     })
 }
 
@@ -3244,6 +3362,10 @@ fn snapshot_updated_at(snapshot_id: i64, timestamp_ms: i64) -> Result<OffsetDate
 
 fn timestamp_ms_to_utc(timestamp_ms: i64) -> std::result::Result<OffsetDateTime, ()> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(timestamp_ms) * 1_000_000).map_err(|_| ())
+}
+
+fn summary_u64(summary: &spec::Summary, key: &str) -> Option<u64> {
+    summary.additional_properties.get(key)?.parse().ok()
 }
 
 fn rounded_average(values: &[u64]) -> Option<u64> {

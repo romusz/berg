@@ -1061,6 +1061,7 @@ fn render_blocks_markdown(blocks: &[Block], heading_level: usize, markdown: &mut
 }
 
 fn render_table_markdown(table: &Table, markdown: &mut String) {
+    let format = markdown_table_format(table);
     let columns = markdown_table_columns(table);
     let headers = columns
         .iter()
@@ -1077,10 +1078,55 @@ fn render_table_markdown(table: &Table, markdown: &mut String) {
     for row in &table.rows {
         let cells = columns
             .iter()
-            .map(|column| escape_markdown_table_cell(&render_table_cell_markdown(row, *column)))
+            .map(|column| {
+                escape_markdown_table_cell(&render_table_cell_markdown(row, *column, &format))
+            })
             .collect::<Vec<_>>();
         writeln!(markdown, "| {} |", cells.join(" | ")).expect("write to string");
     }
+}
+
+#[derive(Debug, Clone)]
+struct MarkdownTableFormat {
+    change_summary_widths: Vec<Option<ChangeSummaryWidths>>,
+}
+
+fn markdown_table_format(table: &Table) -> MarkdownTableFormat {
+    MarkdownTableFormat {
+        change_summary_widths: (0..table.columns.len())
+            .map(|column| table_change_summary_widths(table, column))
+            .collect(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ChangeSummaryWidths {
+    positive: usize,
+    negative: usize,
+    total: usize,
+}
+
+fn table_change_summary_widths(table: &Table, column_index: usize) -> Option<ChangeSummaryWidths> {
+    let mut widths = ChangeSummaryWidths::default();
+    let mut found = false;
+
+    for row in &table.rows {
+        let Some((positive, negative, total)) = row
+            .cells
+            .get(column_index)
+            .and_then(change_summary_cell_values)
+        else {
+            continue;
+        };
+
+        found = true;
+        let cell_widths = change_summary_widths(positive, negative, total);
+        widths.positive = widths.positive.max(cell_widths.positive);
+        widths.negative = widths.negative.max(cell_widths.negative);
+        widths.total = widths.total.max(cell_widths.total);
+    }
+
+    found.then_some(widths)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1150,12 +1196,20 @@ fn render_binary_size_table_header_markdown(table: &Table, column_index: usize) 
     }
 }
 
-fn render_table_cell_markdown(row: &Row, column: MarkdownTableColumn) -> String {
+fn render_table_cell_markdown(
+    row: &Row,
+    column: MarkdownTableColumn,
+    format: &MarkdownTableFormat,
+) -> String {
     match column {
-        MarkdownTableColumn::Source(index) => row
-            .cells
-            .get(index)
-            .map_or_else(String::new, render_cell_markdown),
+        MarkdownTableColumn::Source(index) => {
+            row.cells.get(index).map_or_else(String::new, |cell| {
+                render_source_table_cell_markdown(
+                    cell,
+                    format.change_summary_widths.get(index).copied().flatten(),
+                )
+            })
+        }
         MarkdownTableColumn::Bytes(index) => row
             .cells
             .get(index)
@@ -1164,6 +1218,27 @@ fn render_table_cell_markdown(row: &Row, column: MarkdownTableColumn) -> String 
             .cells
             .get(index)
             .map_or_else(String::new, render_binary_size_table_cell_markdown),
+    }
+}
+
+fn render_source_table_cell_markdown(
+    cell: &Cell,
+    summary_widths: Option<ChangeSummaryWidths>,
+) -> String {
+    match cell.values.as_slice() {
+        [
+            DocumentValue::ChangeSummary {
+                positive,
+                negative,
+                total,
+            },
+        ] => render_change_summary_markdown(
+            *positive,
+            *negative,
+            *total,
+            summary_widths.unwrap_or_else(|| change_summary_widths(*positive, *negative, *total)),
+        ),
+        _ => render_cell_markdown(cell),
     }
 }
 
@@ -1250,6 +1325,7 @@ fn is_numeric_table_cell(cell: &Cell) -> bool {
             | DocumentValue::Unsigned(_)
             | DocumentValue::Bytes(_)
             | DocumentValue::Delta { .. }
+            | DocumentValue::ChangeSummary { .. }
             | DocumentValue::PercentageMillis(_)
             | DocumentValue::Count(_)
             | DocumentValue::MissingValue
@@ -1368,6 +1444,16 @@ fn render_document_value_markdown(value: &DocumentValue) -> String {
         DocumentValue::Unsigned(value) => format!("`{}`", format_u64(*value)),
         DocumentValue::Bytes(value) => render_bytes_markdown(*value),
         DocumentValue::Delta { direction, value } => render_delta_markdown(*direction, *value),
+        DocumentValue::ChangeSummary {
+            positive,
+            negative,
+            total,
+        } => render_change_summary_markdown(
+            *positive,
+            *negative,
+            *total,
+            change_summary_widths(*positive, *negative, *total),
+        ),
         DocumentValue::MissingValue => "?".to_string(),
         DocumentValue::UnknownValue { .. } => "unknown".to_string(),
         DocumentValue::Status(status) => format!("`{}`", render_status_label(*status)),
@@ -1430,6 +1516,56 @@ fn render_delta_markdown(direction: DeltaDirection, value: Option<u64>) -> Strin
     };
 
     format!("`{sign}{}`", format_u64(value.unwrap_or(0)))
+}
+
+fn change_summary_cell_values(cell: &Cell) -> Option<(Option<u64>, Option<u64>, Option<u64>)> {
+    match cell.values.as_slice() {
+        [
+            DocumentValue::ChangeSummary {
+                positive,
+                negative,
+                total,
+            },
+        ] => Some((*positive, *negative, *total)),
+        _ => None,
+    }
+}
+
+fn change_summary_widths(
+    positive: Option<u64>,
+    negative: Option<u64>,
+    total: Option<u64>,
+) -> ChangeSummaryWidths {
+    ChangeSummaryWidths {
+        positive: change_summary_signed_value('+', positive).len(),
+        negative: change_summary_signed_value('-', negative).len(),
+        total: change_summary_total_value(total).len(),
+    }
+}
+
+fn render_change_summary_markdown(
+    positive: Option<u64>,
+    negative: Option<u64>,
+    total: Option<u64>,
+    widths: ChangeSummaryWidths,
+) -> String {
+    let positive = change_summary_signed_value('+', positive);
+    let negative = change_summary_signed_value('-', negative);
+    let total_value = change_summary_total_value(total);
+    let total = total.map_or_else(|| "?".to_string(), |_| format!("`{total_value}`"));
+    let positive_padding = " ".repeat(widths.positive.saturating_sub(positive.len()));
+    let negative_padding = " ".repeat(widths.negative.saturating_sub(negative.len()));
+    let total_padding = " ".repeat(widths.total.saturating_sub(total_value.len()));
+
+    format!("`{positive}`{positive_padding} `{negative}`{negative_padding} {total_padding}{total}")
+}
+
+fn change_summary_signed_value(sign: char, value: Option<u64>) -> String {
+    format!("{sign}{}", format_u64(value.unwrap_or(0)))
+}
+
+fn change_summary_total_value(value: Option<u64>) -> String {
+    value.map_or_else(|| "?".to_string(), format_u64)
 }
 
 fn render_status_label(status: Status) -> &'static str {
@@ -1888,6 +2024,45 @@ mod tests {
         let markdown = render_document_markdown(&document);
 
         assert!(markdown.contains("| `+0` | `-12` | `+0` |"));
+    }
+
+    #[test]
+    fn renders_change_summary_values_with_column_alignment() {
+        let document = Document {
+            title: Cell::text("Change summaries"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![Cell::text("Records")],
+                rows: vec![
+                    Row {
+                        cells: vec![Cell::value(DocumentValue::ChangeSummary {
+                            positive: Some(100),
+                            negative: Some(0),
+                            total: Some(900),
+                        })],
+                    },
+                    Row {
+                        cells: vec![Cell::value(DocumentValue::ChangeSummary {
+                            positive: None,
+                            negative: None,
+                            total: Some(800),
+                        })],
+                    },
+                    Row {
+                        cells: vec![Cell::value(DocumentValue::ChangeSummary {
+                            positive: Some(10),
+                            negative: Some(1),
+                            total: None,
+                        })],
+                    },
+                ],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(markdown.contains("| `+100` `-0` `900` |"));
+        assert!(markdown.contains("| `+0`   `-0` `800` |"));
+        assert!(markdown.contains("| `+10`  `-1`   ? |"));
     }
 
     #[test]

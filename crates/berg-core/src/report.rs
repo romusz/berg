@@ -19,8 +19,8 @@ use std::collections::HashSet;
 
 use crate::document::{
     ApplicabilityStatus, Block, Cell, CompatibilityStatus, CompletenessStatus, ConfidenceStatus,
-    DeltaDirection, Document, DocumentValue, List, ListItem, ListKind, PrecisionStatus, Presence,
-    Property, Row, Section, Status, SupportStatus, Table, UnknownValueKind,
+    Document, DocumentValue, List, ListItem, ListKind, PrecisionStatus, Presence, Property, Row,
+    Section, Status, SupportStatus, Table, UnknownValueKind,
 };
 use crate::engine::{
     BoundPrecision, CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
@@ -1780,28 +1780,6 @@ fn table_snapshot_list_blocks(snapshots: &TableSnapshotList) -> Vec<Block> {
         return vec![Block::Paragraph(Cell::text("No snapshots found."))];
     }
 
-    let record_widths = summary_metric_widths(snapshots.snapshots.iter().map(|snapshot| {
-        (
-            snapshot.added_records,
-            snapshot.deleted_records,
-            snapshot.total_records,
-        )
-    }));
-    let data_file_widths = summary_metric_widths(snapshots.snapshots.iter().map(|snapshot| {
-        (
-            snapshot.added_data_files,
-            snapshot.deleted_data_files,
-            snapshot.total_data_files,
-        )
-    }));
-    let delete_file_widths = summary_metric_widths(snapshots.snapshots.iter().map(|snapshot| {
-        (
-            snapshot.added_delete_files,
-            snapshot.removed_delete_files,
-            snapshot.total_delete_files,
-        )
-    }));
-
     vec![Block::Table(Table {
         columns: vec![
             Cell::text("Committed at"),
@@ -1820,22 +1798,13 @@ fn table_snapshot_list_blocks(snapshots: &TableSnapshotList) -> Vec<Block> {
                 table_snapshot_list_row(
                     snapshot,
                     snapshots.current_snapshot_id == Some(snapshot.snapshot_id),
-                    record_widths,
-                    data_file_widths,
-                    delete_file_widths,
                 )
             })
             .collect(),
     })]
 }
 
-fn table_snapshot_list_row(
-    snapshot: &TableSnapshotListEntry,
-    is_current: bool,
-    record_widths: SummaryMetricWidths,
-    data_file_widths: SummaryMetricWidths,
-    delete_file_widths: SummaryMetricWidths,
-) -> Row {
+fn table_snapshot_list_row(snapshot: &TableSnapshotListEntry, is_current: bool) -> Row {
     Row {
         cells: vec![
             Cell::value(DocumentValue::Timestamp(snapshot.committed_at)),
@@ -1845,19 +1814,16 @@ fn table_snapshot_list_row(
                 snapshot.added_records,
                 snapshot.deleted_records,
                 snapshot.total_records,
-                record_widths,
             ),
             snapshot_summary_metric_cell(
                 snapshot.added_data_files,
                 snapshot.deleted_data_files,
                 snapshot.total_data_files,
-                data_file_widths,
             ),
             snapshot_summary_metric_cell(
                 snapshot.added_delete_files,
                 snapshot.removed_delete_files,
                 snapshot.total_delete_files,
-                delete_file_widths,
             ),
             optional_bytes_or_missing_cell(snapshot.total_file_size_bytes),
             optional_u64_or_missing_cell(snapshot.changed_partition_count),
@@ -1875,138 +1841,16 @@ fn snapshot_id_cell(snapshot_id: i64, is_current: bool) -> Cell {
     Cell::new(values)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SummaryMetricWidths {
-    added: usize,
-    removed: usize,
-    total: usize,
-}
-
-fn summary_metric_widths(
-    metrics: impl IntoIterator<Item = (Option<u64>, Option<u64>, Option<u64>)>,
-) -> SummaryMetricWidths {
-    metrics
-        .into_iter()
-        .map(|(added, removed, total)| SummaryMetricWidths {
-            added: summary_delta_value_len(added, DeltaDirection::Positive),
-            removed: summary_delta_value_len(removed, DeltaDirection::Negative),
-            total: optional_summary_value(total).len(),
-        })
-        .fold(
-            SummaryMetricWidths {
-                added: 0,
-                removed: 0,
-                total: 0,
-            },
-            |left, right| SummaryMetricWidths {
-                added: left.added.max(right.added),
-                removed: left.removed.max(right.removed),
-                total: left.total.max(right.total),
-            },
-        )
-}
-
 fn snapshot_summary_metric_cell(
     added: Option<u64>,
     removed: Option<u64>,
     total: Option<u64>,
-    widths: SummaryMetricWidths,
 ) -> Cell {
-    let mut values = Vec::new();
-
-    push_summary_delta_value(&mut values, added, DeltaDirection::Positive, widths.added);
-    push_text(&mut values, " ");
-    push_summary_delta_value(
-        &mut values,
-        removed,
-        DeltaDirection::Negative,
-        widths.removed,
-    );
-    push_text(&mut values, " ");
-    push_optional_summary_value(&mut values, total, widths.total);
-
-    Cell::new(values)
-}
-
-fn summary_delta_value_len(value: Option<u64>, direction: DeltaDirection) -> usize {
-    summary_delta_value(value, direction).len()
-}
-
-fn push_summary_delta_value(
-    values: &mut Vec<DocumentValue>,
-    value: Option<u64>,
-    direction: DeltaDirection,
-    width: usize,
-) {
-    values.push(DocumentValue::Delta { direction, value });
-    push_padding(
-        values,
-        width.saturating_sub(summary_delta_value_len(value, direction)),
-    );
-}
-
-fn push_optional_summary_value(values: &mut Vec<DocumentValue>, value: Option<u64>, width: usize) {
-    match value {
-        Some(value) => push_right_padded_code(values, grouped_u64(value), width),
-        None => push_right_padded_missing_value(values, width),
-    }
-}
-
-fn push_right_padded_code(values: &mut Vec<DocumentValue>, value: String, width: usize) {
-    push_padding(values, width.saturating_sub(value.len()));
-    values.push(DocumentValue::Code(value));
-}
-
-fn push_right_padded_missing_value(values: &mut Vec<DocumentValue>, width: usize) {
-    push_padding(values, width.saturating_sub(1));
-    values.push(DocumentValue::MissingValue);
-}
-
-fn push_padding(values: &mut Vec<DocumentValue>, width: usize) {
-    if width > 0 {
-        push_text(values, " ".repeat(width));
-    }
-}
-
-fn push_text(values: &mut Vec<DocumentValue>, text: impl Into<String>) {
-    let text = text.into();
-    if text.is_empty() {
-        return;
-    }
-
-    if let Some(DocumentValue::Text(existing)) = values.last_mut() {
-        existing.push_str(&text);
-    } else {
-        values.push(DocumentValue::Text(text));
-    }
-}
-
-fn summary_delta_value(value: Option<u64>, direction: DeltaDirection) -> String {
-    let sign = match direction {
-        DeltaDirection::Positive => '+',
-        DeltaDirection::Negative => '-',
-    };
-
-    format!("{sign}{}", grouped_u64(value.unwrap_or(0)))
-}
-
-fn optional_summary_value(value: Option<u64>) -> String {
-    value.map_or_else(|| "?".to_string(), grouped_u64)
-}
-
-fn grouped_u64(value: u64) -> String {
-    let digits = value.to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-
-    for (index, digit) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push(',');
-        }
-
-        formatted.push(digit);
-    }
-
-    formatted.chars().rev().collect()
+    Cell::value(DocumentValue::ChangeSummary {
+        positive: added,
+        negative: removed,
+        total,
+    })
 }
 
 fn optional_i64_or_missing_cell(value: Option<i64>) -> Cell {
@@ -2342,7 +2186,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        Block, Cell, DeltaDirection, DocumentValue, PrecisionStatus, Presence, Status,
+        Block, Cell, DocumentValue, PrecisionStatus, Presence, Status,
         data_file_size_stats_document, manifest_file_detail_document, manifest_file_list_document,
         schema_document, table_data_max_document, table_partitions_document,
         table_properties_document, table_snapshot_list_document, table_stats_document,
@@ -2971,19 +2815,11 @@ mod tests {
             table.rows[0].cells[1]
         );
         assert_eq!(
-            Cell::new(vec![
-                DocumentValue::Delta {
-                    direction: DeltaDirection::Positive,
-                    value: Some(100),
-                },
-                DocumentValue::Text(" ".to_string()),
-                DocumentValue::Delta {
-                    direction: DeltaDirection::Negative,
-                    value: Some(0),
-                },
-                DocumentValue::Text(" ".to_string()),
-                DocumentValue::Code("900".to_string()),
-            ]),
+            Cell::value(DocumentValue::ChangeSummary {
+                positive: Some(100),
+                negative: Some(0),
+                total: Some(900),
+            }),
             table.rows[0].cells[3]
         );
         assert_eq!(
@@ -2991,19 +2827,11 @@ mod tests {
             table.rows[1].cells[6]
         );
         assert_eq!(
-            Cell::new(vec![
-                DocumentValue::Delta {
-                    direction: DeltaDirection::Positive,
-                    value: None,
-                },
-                DocumentValue::Text("   ".to_string()),
-                DocumentValue::Delta {
-                    direction: DeltaDirection::Negative,
-                    value: None,
-                },
-                DocumentValue::Text(" ".to_string()),
-                DocumentValue::Code("800".to_string()),
-            ]),
+            Cell::value(DocumentValue::ChangeSummary {
+                positive: None,
+                negative: None,
+                total: Some(800),
+            }),
             table.rows[1].cells[3]
         );
     }

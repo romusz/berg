@@ -296,6 +296,15 @@ pub enum DocumentValue {
         /// Absolute delta magnitude, or missing when the source omitted it.
         value: Option<u64>,
     },
+    /// Positive/negative/total summary for a set of changes.
+    ChangeSummary {
+        /// Positive/additive change amount, or missing when the source omitted it.
+        positive: Option<u64>,
+        /// Negative/removal change amount, or missing when the source omitted it.
+        negative: Option<u64>,
+        /// Total after the change, or missing when the source omitted it.
+        total: Option<u64>,
+    },
     /// Missing or unavailable value.
     MissingValue,
     /// Value exists conceptually, but could not be determined.

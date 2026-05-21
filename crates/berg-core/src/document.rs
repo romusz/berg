@@ -166,6 +166,110 @@ pub enum UnknownValueKind {
     Numeric,
 }
 
+/// Semantic status family for renderer-specific labels and styling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// Confidence of a derived value.
+    Confidence(ConfidenceStatus),
+    /// Precision of a derived value.
+    Precision(PrecisionStatus),
+    /// Applicability of data to a decision or result.
+    Applicability(ApplicabilityStatus),
+    /// Completeness of analysis or reads.
+    Completeness(CompletenessStatus),
+    /// Compatibility between observed and expected types/values.
+    Compatibility(CompatibilityStatus),
+    /// Whether a requested operation or target is supported.
+    Support(SupportStatus),
+}
+
+/// Confidence of a derived value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfidenceStatus {
+    /// Fully supported by available metadata.
+    High,
+    /// Partially supported by available metadata.
+    Partial,
+    /// Valid but lowered by known delete impact.
+    Lowered,
+    /// Cannot be determined safely.
+    Unknown,
+    /// No value was available.
+    Unavailable,
+}
+
+/// Precision of a derived value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrecisionStatus {
+    /// Exact within the available evidence.
+    Exact,
+    /// Probably exact, but direct evidence is incomplete.
+    ProbablyExact,
+    /// May be truncated or approximate.
+    PossiblyTruncated,
+    /// Cannot be determined safely.
+    Unknown,
+    /// No value was available.
+    Unavailable,
+}
+
+/// Applicability of one data set to another decision/result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicabilityStatus {
+    /// Applies.
+    Applies,
+    /// Partially applies.
+    PartiallyApplies,
+    /// Does not apply.
+    DoesNotApply,
+    /// Applicability cannot be determined safely.
+    Unknown,
+}
+
+/// Completeness of analysis or reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletenessStatus {
+    /// Complete.
+    Complete,
+    /// Incomplete.
+    Incomplete,
+    /// Not applicable.
+    NotApplicable,
+}
+
+/// Compatibility between observed and expected types/values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibilityStatus {
+    /// Compatible without conversion.
+    Compatible,
+    /// Compatible through safe promotion.
+    SafelyPromoted,
+    /// Incompatible.
+    Incompatible,
+    /// Compatibility cannot be determined safely.
+    Unknown,
+}
+
+/// Whether a requested operation or target is supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportStatus {
+    /// Supported.
+    Supported,
+    /// Unsupported.
+    Unsupported,
+}
+
+/// Presence marker for matrix-like report cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// Present.
+    Present,
+    /// Checked and absent.
+    Absent,
+    /// Not applicable for this row/column.
+    NotApplicable,
+}
+
 /// Semantic inline value that renderers/frontends present in their own medium.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentValue {
@@ -199,6 +303,10 @@ pub enum DocumentValue {
         /// Known category for renderer behavior such as table alignment.
         kind: UnknownValueKind,
     },
+    /// Semantic status.
+    Status(Status),
+    /// Presence marker for matrix-like report cells.
+    Presence(Presence),
     /// Percentage stored as thousandths of one percent.
     PercentageMillis(u64),
     /// Non-negative count.

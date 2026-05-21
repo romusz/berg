@@ -5,8 +5,9 @@ use std::fmt::Write;
 
 use anyhow::{Context, anyhow};
 use berg_core::document::{
-    Block, Cell, DeltaDirection, Document, DocumentValue, List, ListKind, Row, Table,
-    UnknownValueKind,
+    ApplicabilityStatus, Block, Cell, CompatibilityStatus, CompletenessStatus, ConfidenceStatus,
+    DeltaDirection, Document, DocumentValue, List, ListKind, PrecisionStatus, Presence, Row,
+    Status, SupportStatus, Table, UnknownValueKind,
 };
 use berg_core::engine::{
     QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats,
@@ -1216,12 +1217,14 @@ fn is_manifest_column_metadata_table(table: &Table) -> bool {
                 && text_cell_value(field_id) == Some("Field ID")
     ) && table.columns.len() > 2
         && !table.rows.is_empty()
-        && table.rows.iter().all(|row| {
-            row.cells
-                .iter()
-                .skip(2)
-                .all(|cell| matches!(text_cell_value(cell), Some("" | "✓")))
-        })
+        && table
+            .rows
+            .iter()
+            .all(|row| row.cells.iter().skip(2).all(is_presence_table_cell))
+}
+
+fn is_presence_table_cell(cell: &Cell) -> bool {
+    matches!(cell.values.as_slice(), [DocumentValue::Presence(_)])
 }
 
 fn text_cell_value(cell: &Cell) -> Option<&str> {
@@ -1367,6 +1370,8 @@ fn render_document_value_markdown(value: &DocumentValue) -> String {
         DocumentValue::Delta { direction, value } => render_delta_markdown(*direction, *value),
         DocumentValue::MissingValue => "?".to_string(),
         DocumentValue::UnknownValue { .. } => "unknown".to_string(),
+        DocumentValue::Status(status) => format!("`{}`", render_status_label(*status)),
+        DocumentValue::Presence(presence) => render_presence_markdown(*presence).to_string(),
         DocumentValue::PercentageMillis(value) => render_percentage_millis_markdown(*value),
         DocumentValue::Count(value) => format!("`{}`", format_usize(*value)),
         DocumentValue::Bool(value) => {
@@ -1425,6 +1430,78 @@ fn render_delta_markdown(direction: DeltaDirection, value: Option<u64>) -> Strin
     };
 
     format!("`{sign}{}`", format_u64(value.unwrap_or(0)))
+}
+
+fn render_status_label(status: Status) -> &'static str {
+    match status {
+        Status::Confidence(status) => render_confidence_status_label(status),
+        Status::Precision(status) => render_precision_status_label(status),
+        Status::Applicability(status) => render_applicability_status_label(status),
+        Status::Completeness(status) => render_completeness_status_label(status),
+        Status::Compatibility(status) => render_compatibility_status_label(status),
+        Status::Support(status) => render_support_status_label(status),
+    }
+}
+
+fn render_confidence_status_label(status: ConfidenceStatus) -> &'static str {
+    match status {
+        ConfidenceStatus::High => "high",
+        ConfidenceStatus::Partial => "partial",
+        ConfidenceStatus::Lowered => "lowered",
+        ConfidenceStatus::Unknown => "unknown",
+        ConfidenceStatus::Unavailable => "unavailable",
+    }
+}
+
+fn render_precision_status_label(status: PrecisionStatus) -> &'static str {
+    match status {
+        PrecisionStatus::Exact => "exact",
+        PrecisionStatus::ProbablyExact => "probably exact",
+        PrecisionStatus::PossiblyTruncated => "possibly truncated",
+        PrecisionStatus::Unknown => "unknown",
+        PrecisionStatus::Unavailable => "unavailable",
+    }
+}
+
+fn render_applicability_status_label(status: ApplicabilityStatus) -> &'static str {
+    match status {
+        ApplicabilityStatus::Applies => "applies",
+        ApplicabilityStatus::PartiallyApplies => "partially applies",
+        ApplicabilityStatus::DoesNotApply => "does not apply",
+        ApplicabilityStatus::Unknown => "unknown",
+    }
+}
+
+fn render_completeness_status_label(status: CompletenessStatus) -> &'static str {
+    match status {
+        CompletenessStatus::Complete => "complete",
+        CompletenessStatus::Incomplete => "incomplete",
+        CompletenessStatus::NotApplicable => "not applicable",
+    }
+}
+
+fn render_compatibility_status_label(status: CompatibilityStatus) -> &'static str {
+    match status {
+        CompatibilityStatus::Compatible => "compatible",
+        CompatibilityStatus::SafelyPromoted => "safely promoted",
+        CompatibilityStatus::Incompatible => "incompatible",
+        CompatibilityStatus::Unknown => "unknown",
+    }
+}
+
+fn render_support_status_label(status: SupportStatus) -> &'static str {
+    match status {
+        SupportStatus::Supported => "supported",
+        SupportStatus::Unsupported => "unsupported",
+    }
+}
+
+fn render_presence_markdown(presence: Presence) -> &'static str {
+    match presence {
+        Presence::Present => "✓",
+        Presence::Absent => "",
+        Presence::NotApplicable => "n/a",
+    }
 }
 
 fn binary_size(value: u64) -> Option<(String, &'static str)> {
@@ -1536,8 +1613,9 @@ mod tests {
     };
 
     use super::{
-        Cell, DeltaDirection, DocumentFormat, DocumentValue, UnknownValueKind, command_tree,
-        incomplete_command_help, render_document, render_document_markdown,
+        ApplicabilityStatus, Cell, ConfidenceStatus, DeltaDirection, DocumentFormat, DocumentValue,
+        Presence, Status, SupportStatus, UnknownValueKind, command_tree, incomplete_command_help,
+        render_document, render_document_markdown,
     };
 
     #[test]
@@ -1748,6 +1826,37 @@ mod tests {
     }
 
     #[test]
+    fn renders_status_values_as_code_labels() {
+        let document = Document {
+            title: Cell::text("Statuses"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![
+                    Cell::text("Confidence"),
+                    Cell::text("Applicability"),
+                    Cell::text("Support"),
+                ],
+                rows: vec![Row {
+                    cells: vec![
+                        Cell::value(DocumentValue::Status(Status::Confidence(
+                            ConfidenceStatus::Lowered,
+                        ))),
+                        Cell::value(DocumentValue::Status(Status::Applicability(
+                            ApplicabilityStatus::DoesNotApply,
+                        ))),
+                        Cell::value(DocumentValue::Status(Status::Support(
+                            SupportStatus::Unsupported,
+                        ))),
+                    ],
+                }],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(markdown.contains("| `lowered` | `does not apply` | `unsupported` |"));
+    }
+
+    #[test]
     fn renders_delta_values_with_signs() {
         let document = Document {
             title: Cell::text("Delta values"),
@@ -1800,12 +1909,12 @@ mod tests {
                     cells: vec![
                         Cell::code("org_id"),
                         Cell::value(DocumentValue::Number(1)),
-                        Cell::text("✓"),
-                        Cell::text("✓"),
-                        Cell::text(""),
-                        Cell::text(""),
-                        Cell::text("✓"),
-                        Cell::text(""),
+                        Cell::value(DocumentValue::Presence(Presence::Present)),
+                        Cell::value(DocumentValue::Presence(Presence::Present)),
+                        Cell::value(DocumentValue::Presence(Presence::Absent)),
+                        Cell::value(DocumentValue::Presence(Presence::NotApplicable)),
+                        Cell::value(DocumentValue::Presence(Presence::Present)),
+                        Cell::value(DocumentValue::Presence(Presence::Absent)),
                     ],
                 }],
             })],
@@ -1816,6 +1925,7 @@ mod tests {
         assert!(
             markdown.contains("| --- | ---: | :---: | :---: | :---: | :---: | :---: | :---: |")
         );
+        assert!(markdown.contains("| `org_id` | `1` | ✓ | ✓ |  | n/a | ✓ |  |"));
     }
 
     #[test]

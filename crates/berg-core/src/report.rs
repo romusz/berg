@@ -18,8 +18,9 @@ use std::borrow::Borrow;
 use std::collections::HashSet;
 
 use crate::document::{
-    Block, Cell, DeltaDirection, Document, DocumentValue, List, ListItem, ListKind, Property, Row,
-    Section, Table, UnknownValueKind,
+    ApplicabilityStatus, Block, Cell, CompatibilityStatus, CompletenessStatus, ConfidenceStatus,
+    DeltaDirection, Document, DocumentValue, List, ListItem, ListKind, PrecisionStatus, Presence,
+    Property, Row, Section, Status, SupportStatus, Table, UnknownValueKind,
 };
 use crate::engine::{
     BoundPrecision, CurrentDataFileSizeStats, CurrentManifestFileDetail, CurrentManifestFileList,
@@ -490,19 +491,19 @@ fn table_data_max_result_block(max: &CurrentTableMax) -> Block {
                     "Metadata max",
                     max.metadata_max
                         .as_ref()
-                        .map_or_else(|| Cell::code("unavailable"), Cell::code),
+                        .map_or_else(unavailable_status_cell, Cell::code),
                 ))],
             },
             ListItem {
                 blocks: vec![Block::Paragraph(label_value_cell(
                     "Max confidence",
-                    Cell::code(max_confidence_label(max.max_confidence)),
+                    status_cell(max_confidence_status(max.max_confidence)),
                 ))],
             },
             ListItem {
                 blocks: vec![Block::Paragraph(label_value_cell(
                     "Max precision",
-                    Cell::code(bound_precision_label(max.max_precision)),
+                    status_cell(bound_precision_status(max.max_precision)),
                 ))],
             },
             ListItem {
@@ -534,7 +535,7 @@ fn table_data_max_unsupported_properties(max: &CurrentTableMax) -> Vec<Property>
     vec![
         Property {
             label: "Result".to_string(),
-            value: Cell::code("unsupported"),
+            value: status_cell(Status::Support(SupportStatus::Unsupported)),
         },
         Property {
             label: "Reason".to_string(),
@@ -670,7 +671,7 @@ fn table_data_max_equality_delete_properties(max: &CurrentTableMax) -> Vec<Prope
         },
         Property {
             label: "Max equality-delete impact".to_string(),
-            value: Cell::code(delete_impact_label(max.max_equality_delete_impact)),
+            value: status_cell(delete_impact_status(max.max_equality_delete_impact)),
         },
     ]
 }
@@ -774,11 +775,11 @@ fn table_data_max_position_delete_properties(max: &CurrentTableMax) -> Vec<Prope
         },
         Property {
             label: "Max position-delete impact".to_string(),
-            value: Cell::code(delete_impact_label(max.max_position_delete_impact)),
+            value: status_cell(delete_impact_status(max.max_position_delete_impact)),
         },
         Property {
             label: "Max position-delete analysis".to_string(),
-            value: Cell::code(delete_analysis_label(max.max_position_delete_analysis)),
+            value: status_cell(delete_analysis_status(max.max_position_delete_analysis)),
         },
     ]
 }
@@ -787,11 +788,11 @@ fn table_data_max_completeness_properties(max: &CurrentTableMax) -> Vec<Property
     let mut properties = vec![
         Property {
             label: "Read completeness".to_string(),
-            value: Cell::code(read_completeness_label(max.read_completeness)),
+            value: status_cell(read_completeness_status(max.read_completeness)),
         },
         Property {
             label: "Type compatibility".to_string(),
-            value: Cell::code(type_compatibility_label(max.type_compatibility)),
+            value: status_cell(type_compatibility_status(max.type_compatibility)),
         },
     ];
 
@@ -823,59 +824,59 @@ fn table_data_max_completeness_properties(max: &CurrentTableMax) -> Vec<Property
     properties
 }
 
-fn max_confidence_label(confidence: MaxConfidence) -> &'static str {
-    match confidence {
-        MaxConfidence::High => "high",
-        MaxConfidence::Partial => "partial",
-        MaxConfidence::Lowered => "lowered",
-        MaxConfidence::Unknown => "unknown",
-        MaxConfidence::Unavailable => "unavailable",
-    }
+fn max_confidence_status(confidence: MaxConfidence) -> Status {
+    Status::Confidence(match confidence {
+        MaxConfidence::High => ConfidenceStatus::High,
+        MaxConfidence::Partial => ConfidenceStatus::Partial,
+        MaxConfidence::Lowered => ConfidenceStatus::Lowered,
+        MaxConfidence::Unknown => ConfidenceStatus::Unknown,
+        MaxConfidence::Unavailable => ConfidenceStatus::Unavailable,
+    })
 }
 
-fn bound_precision_label(precision: BoundPrecision) -> &'static str {
-    match precision {
-        BoundPrecision::Exact => "exact",
-        BoundPrecision::ProbablyExact => "probably exact",
-        BoundPrecision::PossiblyTruncated => "possibly truncated",
-        BoundPrecision::Unknown => "unknown",
-        BoundPrecision::Unavailable => "unavailable",
-    }
+fn bound_precision_status(precision: BoundPrecision) -> Status {
+    Status::Precision(match precision {
+        BoundPrecision::Exact => PrecisionStatus::Exact,
+        BoundPrecision::ProbablyExact => PrecisionStatus::ProbablyExact,
+        BoundPrecision::PossiblyTruncated => PrecisionStatus::PossiblyTruncated,
+        BoundPrecision::Unknown => PrecisionStatus::Unknown,
+        BoundPrecision::Unavailable => PrecisionStatus::Unavailable,
+    })
 }
 
-fn delete_impact_label(impact: DeleteImpact) -> &'static str {
-    match impact {
-        DeleteImpact::Unaffected => "unaffected",
-        DeleteImpact::PartiallyAffected => "partially affected",
-        DeleteImpact::AllCandidatesPossiblyAffected => "all candidates possibly affected",
-        DeleteImpact::AllCandidatesTouched => "all candidates touched",
-        DeleteImpact::Unknown => "unknown",
-        DeleteImpact::NotApplicable => "not applicable",
-    }
+fn delete_impact_status(impact: DeleteImpact) -> Status {
+    Status::Applicability(match impact {
+        DeleteImpact::Unaffected | DeleteImpact::NotApplicable => ApplicabilityStatus::DoesNotApply,
+        DeleteImpact::PartiallyAffected => ApplicabilityStatus::PartiallyApplies,
+        DeleteImpact::AllCandidatesTouched => ApplicabilityStatus::Applies,
+        DeleteImpact::AllCandidatesPossiblyAffected | DeleteImpact::Unknown => {
+            ApplicabilityStatus::Unknown
+        }
+    })
 }
 
-fn delete_analysis_label(analysis: DeleteAnalysisCompleteness) -> &'static str {
-    match analysis {
-        DeleteAnalysisCompleteness::Complete => "complete",
-        DeleteAnalysisCompleteness::Incomplete => "incomplete",
-        DeleteAnalysisCompleteness::NotApplicable => "not applicable",
-    }
+fn delete_analysis_status(analysis: DeleteAnalysisCompleteness) -> Status {
+    Status::Completeness(match analysis {
+        DeleteAnalysisCompleteness::Complete => CompletenessStatus::Complete,
+        DeleteAnalysisCompleteness::Incomplete => CompletenessStatus::Incomplete,
+        DeleteAnalysisCompleteness::NotApplicable => CompletenessStatus::NotApplicable,
+    })
 }
 
-fn read_completeness_label(completeness: ReadCompleteness) -> &'static str {
-    match completeness {
-        ReadCompleteness::Complete => "complete",
-        ReadCompleteness::Incomplete => "incomplete",
-    }
+fn read_completeness_status(completeness: ReadCompleteness) -> Status {
+    Status::Completeness(match completeness {
+        ReadCompleteness::Complete => CompletenessStatus::Complete,
+        ReadCompleteness::Incomplete => CompletenessStatus::Incomplete,
+    })
 }
 
-fn type_compatibility_label(compatibility: TypeCompatibility) -> &'static str {
-    match compatibility {
-        TypeCompatibility::Exact => "exact",
-        TypeCompatibility::SafelyPromoted => "safely promoted",
-        TypeCompatibility::Incompatible => "incompatible",
-        TypeCompatibility::Unknown => "unknown",
-    }
+fn type_compatibility_status(compatibility: TypeCompatibility) -> Status {
+    Status::Compatibility(match compatibility {
+        TypeCompatibility::Exact => CompatibilityStatus::Compatible,
+        TypeCompatibility::SafelyPromoted => CompatibilityStatus::SafelyPromoted,
+        TypeCompatibility::Incompatible => CompatibilityStatus::Incompatible,
+        TypeCompatibility::Unknown => CompatibilityStatus::Unknown,
+    })
 }
 
 fn ratio_count_cell(numerator: usize, denominator: usize) -> Cell {
@@ -884,6 +885,14 @@ fn ratio_count_cell(numerator: usize, denominator: usize) -> Cell {
         DocumentValue::Text(" / ".to_string()),
         DocumentValue::Count(denominator),
     ])
+}
+
+fn status_cell(status: Status) -> Cell {
+    Cell::value(DocumentValue::Status(status))
+}
+
+fn unavailable_status_cell() -> Cell {
+    status_cell(Status::Confidence(ConfidenceStatus::Unavailable))
 }
 
 fn missing_value_cell() -> Cell {
@@ -1168,15 +1177,17 @@ fn column_metadata_row(metadata: &ManifestColumnMetadataSummary, fields: &[Strin
 }
 
 fn column_metadata_presence_cell(metadata: &ManifestColumnMetadataSummary, field: &str) -> Cell {
-    if metadata
+    let presence = if metadata
         .metadata_fields
         .iter()
         .any(|metadata_field| metadata_field == field)
     {
-        Cell::text("✓")
+        Presence::Present
     } else {
-        Cell::text("")
-    }
+        Presence::Absent
+    };
+
+    Cell::value(DocumentValue::Presence(presence))
 }
 
 fn manifest_length_cell(length: i64) -> Cell {
@@ -2331,10 +2342,10 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        Block, Cell, DeltaDirection, DocumentValue, data_file_size_stats_document,
-        manifest_file_detail_document, manifest_file_list_document, schema_document,
-        table_data_max_document, table_partitions_document, table_properties_document,
-        table_snapshot_list_document, table_stats_document,
+        Block, Cell, DeltaDirection, DocumentValue, PrecisionStatus, Presence, Status,
+        data_file_size_stats_document, manifest_file_detail_document, manifest_file_list_document,
+        schema_document, table_data_max_document, table_partitions_document,
+        table_properties_document, table_snapshot_list_document, table_stats_document,
     };
 
     fn nested_schema() -> Schema {
@@ -3216,7 +3227,7 @@ mod tests {
         assert_eq!(
             Block::Paragraph(Cell::new(vec![
                 DocumentValue::Text("Max precision: ".to_string()),
-                DocumentValue::Code("exact".to_string())
+                DocumentValue::Status(Status::Precision(PrecisionStatus::Exact))
             ])),
             result_items.items[2].blocks[0]
         );
@@ -3548,12 +3559,12 @@ mod tests {
             vec![
                 Cell::code("org_id"),
                 Cell::value(DocumentValue::Number(1)),
-                Cell::text("✓"),
-                Cell::text("✓"),
-                Cell::text("✓"),
-                Cell::text(""),
-                Cell::text("✓"),
-                Cell::text("✓"),
+                Cell::value(DocumentValue::Presence(Presence::Present)),
+                Cell::value(DocumentValue::Presence(Presence::Present)),
+                Cell::value(DocumentValue::Presence(Presence::Present)),
+                Cell::value(DocumentValue::Presence(Presence::Absent)),
+                Cell::value(DocumentValue::Presence(Presence::Present)),
+                Cell::value(DocumentValue::Presence(Presence::Present)),
             ],
             column_metadata_table.rows[0].cells
         );
@@ -3561,12 +3572,12 @@ mod tests {
             vec![
                 Cell::code("metadata.labels"),
                 Cell::value(DocumentValue::Number(3)),
-                Cell::text("✓"),
-                Cell::text(""),
-                Cell::text(""),
-                Cell::text(""),
-                Cell::text(""),
-                Cell::text(""),
+                Cell::value(DocumentValue::Presence(Presence::Present)),
+                Cell::value(DocumentValue::Presence(Presence::Absent)),
+                Cell::value(DocumentValue::Presence(Presence::Absent)),
+                Cell::value(DocumentValue::Presence(Presence::Absent)),
+                Cell::value(DocumentValue::Presence(Presence::Absent)),
+                Cell::value(DocumentValue::Presence(Presence::Absent)),
             ],
             column_metadata_table.rows[1].cells
         );

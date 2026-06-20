@@ -1,0 +1,8 @@
+[toolchain]
+# Pin the toolchain used for local development, formatting, and linting so that
+# `cargo fmt --check` and `cargo clippy` are reproducible across machines and CI.
+# The minimum supported Rust version (MSRV) is declared separately as
+# `rust-version` in Cargo.toml and is verified by the dedicated MSRV CI job.
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

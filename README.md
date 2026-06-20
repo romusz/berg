@@ -187,9 +187,15 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-CI runs these checks on every pull request and push to `main`. Tests run on both
-the declared MSRV (`1.92`) and stable Rust. Formatting and clippy run on stable
-Rust.
+This repository pins its development toolchain in `rust-toolchain.toml`. Running
+any Cargo command inside a checkout makes `rustup` install and use that toolchain
+automatically, so your formatting and clippy results match CI.
+
+On every pull request and push to `main`, CI runs formatting and clippy on the
+pinned toolchain, and runs the test suite against both the declared MSRV (`1.92`,
+from `Cargo.toml`) and the latest stable Rust. This keeps lint results
+reproducible while catching MSRV regressions and breakage on new compiler
+releases.
 
 `--locked` rejects builds when `Cargo.lock` is out of date. After editing
 `Cargo.toml`, run the same Cargo command without `--locked` once to refresh the

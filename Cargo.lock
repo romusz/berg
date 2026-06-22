@@ -787,6 +787,7 @@ dependencies = [
  "anyhow",
  "berg-core",
  "clap",
+ "serde_json",
  "time",
  "tokio",
 ]

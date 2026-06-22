@@ -10,16 +10,18 @@ use berg_core::document::{
     Status, SupportStatus, Table, UnknownValueKind,
 };
 use berg_core::engine::{
-    QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats,
+    CurrentSchemaInfo, QualifiedTableIdent, RestCatalogConfig, load_current_data_file_size_stats,
     load_current_manifest_file_detail, load_current_manifest_file_list, load_current_schema,
-    load_current_table_max, load_current_table_partitions, load_current_table_properties,
-    load_current_table_stats, load_table_snapshot_list, parse_catalog_property,
+    load_current_schema_info, load_current_table_max, load_current_table_partitions,
+    load_current_table_properties, load_current_table_stats, load_table_snapshot_list,
+    parse_catalog_property,
 };
 use berg_core::report::{
     data_file_size_stats_document, manifest_file_detail_document, manifest_file_list_document,
     schema_document, table_data_max_document, table_partitions_document, table_properties_document,
     table_snapshot_list_document, table_stats_document,
 };
+use berg_core::spec;
 use clap::error::ErrorKind;
 use clap::{ArgAction, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
 use time::format_description::well_known::Rfc3339;
@@ -169,8 +171,32 @@ struct TableSchemaArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableSchemaCommands {
+    /// Compare the current schema across datacenters.
+    Compare(CompareSchemaArgs),
     /// Show the current schema.
     Current(CurrentSchemaArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    override_usage = "berg table schema compare --catalog-uri-template <URI> [--show-schema] <table-id> <datacenters>"
+)]
+struct CompareSchemaArgs {
+    /// Table ID: catalog.namespace.table.
+    #[arg(value_name = "table-id")]
+    table: String,
+
+    /// Comma-separated datacenters to compare.
+    #[arg(value_name = "datacenters")]
+    datacenters: String,
+
+    /// REST catalog URI template. Use `{dc}` or `{datacenter}` for each datacenter.
+    #[arg(long = "catalog-uri-template", value_name = "URI")]
+    catalog_uri_template: String,
+
+    /// Print the baseline current schema when all datacenters match.
+    #[arg(long)]
+    show_schema: bool,
 }
 
 #[derive(Debug, Args)]
@@ -439,6 +465,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
             TableCommands::Schema(schema_args) => match schema_args.command {
+                TableSchemaCommands::Compare(args) => {
+                    if !print_compare_schema(args, catalog_args).await? {
+                        std::process::exit(1);
+                    }
+                }
                 TableSchemaCommands::Current(args) => {
                     print_current_schema(args, catalog_args).await?;
                 }
@@ -639,6 +670,371 @@ async fn print_current_schema(
     print!("{}", render_document(&document, args.output.format)?);
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct DatacenterSchema {
+    datacenter: String,
+    endpoint: String,
+    info: CurrentSchemaInfo,
+}
+
+#[derive(Debug)]
+struct SchemaCompareConfig {
+    catalog_uri_template: String,
+    catalog_prefix: Option<String>,
+    catalog_warehouse: Option<String>,
+    catalog_properties: HashMap<String, String>,
+    s3_profile: Option<String>,
+    aws_vault_profile: Option<String>,
+}
+
+async fn print_compare_schema(
+    args: CompareSchemaArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<bool> {
+    let table = QualifiedTableIdent::parse(&args.table)?;
+    let datacenters = parse_datacenters(&args.datacenters)?;
+    let compare_config = schema_compare_config(&args, catalog_args)?;
+    let mut results = Vec::with_capacity(datacenters.len());
+
+    for datacenter in &datacenters {
+        results.push(
+            load_datacenter_schema(datacenter, &table, &compare_config)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to load current schema for `{}` in `{datacenter}`",
+                        table.display_name()
+                    )
+                })?,
+        );
+    }
+
+    let baseline = &results[0];
+    let mut mismatches = Vec::new();
+    for result in &results[1..] {
+        if !schema_equal(baseline.info.schema.as_ref(), result.info.schema.as_ref()) {
+            mismatches.push(result);
+        }
+    }
+
+    let mut output = String::new();
+    write_schema_compare_header(&mut output, &table, &datacenters);
+    write_schema_compare_summary(&mut output, &results);
+
+    if !mismatches.is_empty() {
+        write_schema_compare_result(
+            &mut output,
+            false,
+            baseline.datacenter.as_str(),
+            results.len(),
+        );
+        write_schema_diffs(&mut output, baseline, &mismatches)?;
+        print!("{output}");
+
+        return Ok(false);
+    }
+
+    write_schema_compare_result(
+        &mut output,
+        true,
+        baseline.datacenter.as_str(),
+        results.len(),
+    );
+
+    if args.show_schema {
+        write_baseline_schema_section(&mut output, &table, baseline);
+    }
+
+    print!("{output}");
+
+    Ok(true)
+}
+
+fn write_schema_compare_header(
+    output: &mut String,
+    table: &QualifiedTableIdent,
+    datacenters: &[String],
+) {
+    writeln!(output, "# Schema Compare: `{}`", table.display_name()).expect("write to string");
+    writeln!(output).expect("write to string");
+    writeln!(output, "- Table: `{}`", table.display_name()).expect("write to string");
+    writeln!(
+        output,
+        "- Compared datacenters: `{}`",
+        datacenters.join("`, `")
+    )
+    .expect("write to string");
+    writeln!(output).expect("write to string");
+}
+
+fn write_schema_compare_result(
+    output: &mut String,
+    schemas_match: bool,
+    baseline_datacenter: &str,
+    datacenter_count: usize,
+) {
+    writeln!(output, "## Result").expect("write to string");
+    writeln!(output).expect("write to string");
+
+    if schemas_match {
+        writeln!(
+            output,
+            "Schemas match across `{datacenter_count}` datacenters."
+        )
+        .expect("write to string");
+    } else {
+        writeln!(
+            output,
+            "Schemas differ from baseline `{baseline_datacenter}`."
+        )
+        .expect("write to string");
+    }
+
+    writeln!(output).expect("write to string");
+}
+
+fn write_baseline_schema_section(
+    output: &mut String,
+    table: &QualifiedTableIdent,
+    baseline: &DatacenterSchema,
+) {
+    writeln!(output, "## Baseline Schema: `{}`", baseline.datacenter).expect("write to string");
+    writeln!(output).expect("write to string");
+
+    let document = schema_document(
+        table.display_name(),
+        baseline.endpoint.clone(),
+        OffsetDateTime::now_utc(),
+        baseline.info.schema.clone(),
+    );
+    render_blocks_markdown(&document.blocks, 3, output);
+}
+
+async fn load_datacenter_schema(
+    datacenter: &str,
+    table: &QualifiedTableIdent,
+    compare_config: &SchemaCompareConfig,
+) -> anyhow::Result<DatacenterSchema> {
+    let config = datacenter_rest_catalog_config(datacenter, table, compare_config)?;
+    let endpoint = config.table_endpoint(table.table());
+    let info = load_current_schema_info(&config, table.table()).await?;
+
+    Ok(DatacenterSchema {
+        datacenter: datacenter.to_string(),
+        endpoint,
+        info,
+    })
+}
+
+fn schema_compare_config(
+    args: &CompareSchemaArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<SchemaCompareConfig> {
+    let catalog_uri_template = args.catalog_uri_template.clone();
+    let catalog_prefix = first_configured_value(catalog_args.prefix, "BERG_CATALOG_PREFIX")?;
+    let catalog_warehouse =
+        first_configured_value(catalog_args.warehouse, "BERG_CATALOG_WAREHOUSE")?;
+    let catalog_token = first_configured_value(catalog_args.token, "BERG_CATALOG_TOKEN")?;
+    let catalog_credential =
+        first_configured_value(catalog_args.credential, "BERG_CATALOG_CREDENTIAL")?;
+    let catalog_properties = catalog_properties(
+        catalog_args.properties,
+        catalog_args.headers,
+        catalog_token,
+        catalog_credential,
+    )?;
+    let s3_profile = first_configured_value(catalog_args.s3_profile, "BERG_S3_PROFILE")?;
+    let aws_vault_profile =
+        first_configured_value(catalog_args.aws_vault_profile, "BERG_AWS_VAULT_PROFILE")?;
+
+    Ok(SchemaCompareConfig {
+        catalog_uri_template,
+        catalog_prefix,
+        catalog_warehouse,
+        catalog_properties,
+        s3_profile,
+        aws_vault_profile,
+    })
+}
+
+fn datacenter_rest_catalog_config(
+    datacenter: &str,
+    table: &QualifiedTableIdent,
+    compare_config: &SchemaCompareConfig,
+) -> anyhow::Result<RestCatalogConfig> {
+    let prefix = compare_config
+        .catalog_prefix
+        .as_deref()
+        .unwrap_or_else(|| table.catalog());
+    let config = RestCatalogConfig::new(
+        render_datacenter_template(&compare_config.catalog_uri_template, datacenter),
+        prefix,
+        compare_config.catalog_warehouse.clone(),
+        compare_config.catalog_properties.clone(),
+    )?;
+
+    Ok(config
+        .with_s3_profile(compare_config.s3_profile.clone())
+        .with_aws_vault_profile(compare_config.aws_vault_profile.clone()))
+}
+
+fn render_datacenter_template(template: &str, datacenter: &str) -> String {
+    template
+        .replace("{datacenter}", datacenter)
+        .replace("{dc}", datacenter)
+}
+
+fn parse_datacenters(value: &str) -> anyhow::Result<Vec<String>> {
+    let datacenters = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if datacenters.len() < 2 {
+        anyhow::bail!("provide at least two datacenters");
+    }
+
+    Ok(datacenters)
+}
+
+fn write_schema_compare_summary(output: &mut String, results: &[DatacenterSchema]) {
+    writeln!(output, "## Datacenter Summary").expect("write to string");
+    writeln!(output).expect("write to string");
+    writeln!(
+        output,
+        "| Datacenter | Schema ID | Fields | Metadata location |"
+    )
+    .expect("write to string");
+    writeln!(output, "| --- | ---: | ---: | --- |").expect("write to string");
+
+    for result in results {
+        writeln!(
+            output,
+            "| `{}` | `{}` | `{}` | `{}` |",
+            escape_markdown_table_cell(&result.datacenter),
+            result.info.current_schema_id,
+            result.info.schema.as_struct().fields().len(),
+            escape_markdown_table_cell(&result.info.metadata_json_path)
+        )
+        .expect("write to string");
+    }
+
+    writeln!(output).expect("write to string");
+}
+
+fn write_schema_diffs(
+    output: &mut String,
+    baseline: &DatacenterSchema,
+    others: &[&DatacenterSchema],
+) -> anyhow::Result<()> {
+    let baseline_text = canonical_schema_text(baseline.info.schema.as_ref())?;
+
+    writeln!(output, "## Schema Diffs").expect("write to string");
+
+    for other in others {
+        writeln!(output).expect("write to string");
+        writeln!(
+            output,
+            "### `{}` vs `{}`",
+            baseline.datacenter, other.datacenter
+        )
+        .expect("write to string");
+        writeln!(output).expect("write to string");
+        writeln!(output, "```diff").expect("write to string");
+        output.push_str(&unified_diff(
+            &baseline.datacenter,
+            &other.datacenter,
+            &baseline_text,
+            &canonical_schema_text(other.info.schema.as_ref())?,
+        ));
+        writeln!(output, "```").expect("write to string");
+    }
+
+    writeln!(output).expect("write to string");
+
+    Ok(())
+}
+
+fn schema_equal(left: &spec::Schema, right: &spec::Schema) -> bool {
+    left == right
+}
+
+fn canonical_schema_text(schema: &spec::Schema) -> anyhow::Result<Vec<String>> {
+    Ok(serde_json::to_string_pretty(schema)?
+        .lines()
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn unified_diff(left_label: &str, right_label: &str, left: &[String], right: &[String]) -> String {
+    const CONTEXT_LINES: usize = 3;
+
+    let mut prefix_len = 0;
+    while prefix_len < left.len()
+        && prefix_len < right.len()
+        && left[prefix_len] == right[prefix_len]
+    {
+        prefix_len += 1;
+    }
+
+    if prefix_len == left.len() && prefix_len == right.len() {
+        return String::new();
+    }
+
+    let mut suffix_len = 0;
+    while suffix_len < left.len() - prefix_len
+        && suffix_len < right.len() - prefix_len
+        && left[left.len() - 1 - suffix_len] == right[right.len() - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    let left_change_end = left.len() - suffix_len;
+    let right_change_end = right.len() - suffix_len;
+    let left_hunk_start = prefix_len.saturating_sub(CONTEXT_LINES);
+    let right_hunk_start = prefix_len.saturating_sub(CONTEXT_LINES);
+    let left_hunk_end = left.len().min(left_change_end + CONTEXT_LINES);
+    let right_hunk_end = right.len().min(right_change_end + CONTEXT_LINES);
+    let mut output = String::new();
+
+    writeln!(output, "--- {left_label}").expect("write to string");
+    writeln!(output, "+++ {right_label}").expect("write to string");
+    writeln!(
+        output,
+        "@@ -{},{} +{},{} @@",
+        hunk_range_start(left_hunk_start, left_hunk_end - left_hunk_start),
+        left_hunk_end - left_hunk_start,
+        hunk_range_start(right_hunk_start, right_hunk_end - right_hunk_start),
+        right_hunk_end - right_hunk_start
+    )
+    .expect("write to string");
+
+    for line in &left[left_hunk_start..prefix_len] {
+        writeln!(output, " {line}").expect("write to string");
+    }
+    for line in &left[prefix_len..left_change_end] {
+        writeln!(output, "-{line}").expect("write to string");
+    }
+    for line in &right[prefix_len..right_change_end] {
+        writeln!(output, "+{line}").expect("write to string");
+    }
+    for line in &left[left_change_end..left_hunk_end] {
+        writeln!(output, " {line}").expect("write to string");
+    }
+
+    output
+}
+
+fn hunk_range_start(start_index: usize, count: usize) -> usize {
+    if count == 0 {
+        start_index
+    } else {
+        start_index + 1
+    }
 }
 
 async fn print_current_table_partitions(
@@ -1743,15 +2139,20 @@ fn separate_utc_offset(time: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::sync::Arc;
 
     use berg_core::document::{
         Block, Document, List, ListItem, ListKind, Property, Row, Section, Table,
     };
+    use berg_core::engine::CurrentSchemaInfo;
+    use berg_core::spec::Schema;
 
     use super::{
-        ApplicabilityStatus, Cell, ConfidenceStatus, DeltaDirection, DocumentFormat, DocumentValue,
-        Presence, Status, SupportStatus, UnknownValueKind, command_tree, incomplete_command_help,
-        render_document, render_document_markdown,
+        ApplicabilityStatus, Cell, ConfidenceStatus, DatacenterSchema, DeltaDirection,
+        DocumentFormat, DocumentValue, Presence, Status, SupportStatus, UnknownValueKind,
+        command_tree, incomplete_command_help, parse_datacenters, render_datacenter_template,
+        render_document, render_document_markdown, unified_diff, write_schema_compare_header,
+        write_schema_compare_result, write_schema_compare_summary,
     };
 
     #[test]
@@ -2176,6 +2577,9 @@ mod tests {
             tree.contains("│   │   └── current - Show properties from the current table metadata")
         );
         assert!(tree.contains("│   ├── schema - Inspect table schemas"));
+        assert!(
+            tree.contains("│   │   ├── compare - Compare the current schema across datacenters")
+        );
         assert!(tree.contains("│   │   └── current - Show the current schema"));
         assert!(tree.contains("│   ├── snapshots - Inspect table snapshots"));
         assert!(
@@ -2185,6 +2589,72 @@ mod tests {
         );
         assert!(tree.contains("│   └── stats - Inspect table statistics"));
         assert!(tree.contains("└── commands - Print the full command tree"));
+    }
+
+    #[test]
+    fn parses_schema_compare_datacenters() {
+        let datacenters =
+            parse_datacenters("dc1.prod, dc2.prod,dc3.staging").expect("valid datacenters");
+
+        assert_eq!(datacenters, vec!["dc1.prod", "dc2.prod", "dc3.staging"]);
+    }
+
+    #[test]
+    fn rejects_schema_compare_with_less_than_two_datacenters() {
+        let err = parse_datacenters("dc1.prod").expect_err("requires at least two datacenters");
+
+        assert!(err.to_string().contains("at least two"));
+    }
+
+    #[test]
+    fn renders_datacenter_template() {
+        let rendered =
+            render_datacenter_template("https://catalog-{dc}.example.com/{datacenter}", "dc1.prod");
+
+        assert_eq!(rendered, "https://catalog-dc1.prod.example.com/dc1.prod");
+    }
+
+    #[test]
+    fn renders_schema_compare_summary_as_markdown() {
+        let table = super::QualifiedTableIdent::parse("lakehouse.ns.tbl").expect("valid table");
+        let datacenters = vec!["dc1".to_string(), "dc2".to_string()];
+        let schema = Arc::new(Schema::builder().with_schema_id(7).build().expect("schema"));
+        let results = [DatacenterSchema {
+            datacenter: "dc1".to_string(),
+            endpoint: "https://catalog-dc1.example.com/v1/lakehouse/namespaces/ns/tables/tbl"
+                .to_string(),
+            info: CurrentSchemaInfo {
+                metadata_json_path: "s3://bucket/metadata.json".to_string(),
+                table_location: "s3://bucket/table".to_string(),
+                current_schema_id: 7,
+                schema,
+            },
+        }];
+        let mut markdown = String::new();
+
+        write_schema_compare_header(&mut markdown, &table, &datacenters);
+        write_schema_compare_summary(&mut markdown, &results);
+        write_schema_compare_result(&mut markdown, true, "dc1", 2);
+
+        assert!(markdown.contains("# Schema Compare: `lakehouse.ns.tbl`"));
+        assert!(markdown.contains("- Compared datacenters: `dc1`, `dc2`"));
+        assert!(markdown.contains("## Datacenter Summary"));
+        assert!(markdown.contains("| Datacenter | Schema ID | Fields | Metadata location |"));
+        assert!(markdown.contains("| `dc1` | `7` | `0` | `s3://bucket/metadata.json` |"));
+        assert!(markdown.contains("## Result"));
+        assert!(markdown.contains("Schemas match across `2` datacenters."));
+    }
+
+    #[test]
+    fn renders_unified_schema_diff() {
+        let left = ["{".to_string(), "  \"a\": 1".to_string(), "}".to_string()];
+        let right = ["{".to_string(), "  \"a\": 2".to_string(), "}".to_string()];
+        let diff = unified_diff("dc1", "dc2", &left, &right);
+
+        assert!(diff.contains("--- dc1"));
+        assert!(diff.contains("+++ dc2"));
+        assert!(diff.contains("-  \"a\": 1"));
+        assert!(diff.contains("+  \"a\": 2"));
     }
 
     #[test]

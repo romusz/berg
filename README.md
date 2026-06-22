@@ -68,6 +68,14 @@ Inspect a table schema through an Iceberg REST catalog:
 berg --catalog-uri http://localhost:8181 table schema current warehouse.db.table
 ```
 
+Compare a table schema across REST catalog endpoints:
+
+```sh
+berg \
+  --catalog-uri-template 'https://catalog-{dc}.example.com' \
+  table schema compare warehouse.db.table dc1,dc2 --show-schema
+```
+
 Inspect current snapshot statistics:
 
 ```sh
@@ -120,6 +128,7 @@ environment variable.
 | Additional REST header | `--catalog-header NAME=VALUE` | `BERG_CATALOG_HEADERS` |
 | AWS profile for S3 reads | `--s3-profile` | `BERG_S3_PROFILE` |
 | aws-vault profile for S3 reads | `--aws-vault-profile` | `BERG_AWS_VAULT_PROFILE` |
+| Schema compare catalog URI template | `--catalog-uri-template` | n/a |
 
 `--catalog-property` and `--catalog-header` can be repeated. The environment
 variables `BERG_CATALOG_PROPERTIES` and `BERG_CATALOG_HEADERS` accept
@@ -144,6 +153,14 @@ berg \
   table partitions current warehouse.db.table
 ```
 
+`table schema compare` accepts one comma-separated list of datacenter or endpoint
+labels and renders `--catalog-uri-template` once per label. Templates support
+`{dc}` and `{datacenter}` for the full label. Authentication uses the normal
+catalog configuration flags and environment variables, such as `--catalog-token`,
+`--catalog-credential`, `--catalog-header`, and `--catalog-property`.
+Pass `--show-schema` to print the baseline current schema when all compared
+datacenters match.
+
 ## Output Formats
 
 Document-producing commands support `--format`:
@@ -164,6 +181,7 @@ berg
 ├── table manifest files inspect
 ├── table partitions current
 ├── table properties current
+├── table schema compare
 ├── table schema current
 ├── table stats current
 └── commands

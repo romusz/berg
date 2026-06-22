@@ -35,6 +35,7 @@ iceberg-storage-opendal = "0.9"
 parquet = { version = "57.3.0", features = ["async"] }
 ratatui = "0.30.0"
 reqwest = "0.12"
+serde_json = "1"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["formatting", "local-offset"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -237,6 +237,19 @@ pub struct CurrentTableProperties {
     pub properties: Vec<TablePropertyEntry>,
 }
 
+/// Current table schema plus table metadata identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentSchemaInfo {
+    /// Current table metadata JSON location.
+    pub metadata_json_path: String,
+    /// Table base location.
+    pub table_location: String,
+    /// Current schema ID.
+    pub current_schema_id: i32,
+    /// Current Iceberg schema.
+    pub schema: spec::SchemaRef,
+}
+
 /// One table property key/value pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TablePropertyEntry {
@@ -778,9 +791,28 @@ pub async fn load_current_schema(
     config: &RestCatalogConfig,
     table_ident: &TableIdent,
 ) -> Result<spec::SchemaRef> {
-    let table = load_table(config, table_ident).await?;
+    Ok(load_current_schema_info(config, table_ident).await?.schema)
+}
 
-    Ok(table.metadata().current_schema().clone())
+/// Load the current schema and table metadata identifiers through an Iceberg REST catalog.
+///
+/// # Errors
+///
+/// Returns an Iceberg-backed error when the catalog cannot be constructed,
+/// contacted, or cannot load the requested table.
+pub async fn load_current_schema_info(
+    config: &RestCatalogConfig,
+    table_ident: &TableIdent,
+) -> Result<CurrentSchemaInfo> {
+    let table = load_table(config, table_ident).await?;
+    let metadata = table.metadata();
+
+    Ok(CurrentSchemaInfo {
+        metadata_json_path: table.metadata_location_result()?.to_string(),
+        table_location: metadata.location().to_string(),
+        current_schema_id: metadata.current_schema_id(),
+        schema: metadata.current_schema().clone(),
+    })
 }
 
 /// Load properties from the current table metadata through an Iceberg REST catalog.

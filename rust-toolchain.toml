@@ -4,5 +4,5 @@
 # The minimum supported Rust version (MSRV) is declared separately as
 # `rust-version` in Cargo.toml and is verified by the dedicated MSRV CI job.
 channel = "1.96.0"
-components = ["rustfmt", "clippy"]
+components = ["rustfmt", "clippy", "rust-analyzer"]
 profile = "minimal"

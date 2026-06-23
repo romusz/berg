@@ -2295,8 +2295,8 @@ mod tests {
         let schema = nested_schema();
 
         let document = schema_document(
-            "lakehouse.redapl_v3.k8s_pod_blue",
-            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            "warehouse.analytics.events",
+            "https://example.test/v1/warehouse/namespaces/analytics/tables/events",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
             schema,
         );
@@ -2304,7 +2304,7 @@ mod tests {
         assert_eq!(
             Cell::new(vec![
                 DocumentValue::Text("Schema: ".to_string()),
-                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+                DocumentValue::Code("warehouse.analytics.events".to_string())
             ]),
             document.title
         );
@@ -2451,8 +2451,8 @@ mod tests {
         };
 
         let document = table_stats_document(
-            "lakehouse.redapl_v3.k8s_pod_blue",
-            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            "warehouse.analytics.events",
+            "https://example.test/v1/warehouse/namespaces/analytics/tables/events",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
             &stats,
         );
@@ -2460,7 +2460,7 @@ mod tests {
         assert_eq!(
             Cell::new(vec![
                 DocumentValue::Text("Table Stats: ".to_string()),
-                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+                DocumentValue::Code("warehouse.analytics.events".to_string())
             ]),
             document.title
         );
@@ -2606,8 +2606,8 @@ mod tests {
         };
 
         let document = table_properties_document(
-            "lakehouse.redapl_v3.k8s_pod_blue",
-            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            "warehouse.analytics.events",
+            "https://example.test/v1/warehouse/namespaces/analytics/tables/events",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
             &properties,
         );
@@ -2615,7 +2615,7 @@ mod tests {
         assert_eq!(
             Cell::new(vec![
                 DocumentValue::Text("Table Properties: ".to_string()),
-                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+                DocumentValue::Code("warehouse.analytics.events".to_string())
             ]),
             document.title
         );
@@ -2679,8 +2679,8 @@ mod tests {
         };
 
         let document = table_properties_document(
-            "lakehouse.redapl_v3.k8s_pod_blue",
-            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            "warehouse.analytics.events",
+            "https://example.test/v1/warehouse/namespaces/analytics/tables/events",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
             &properties,
         );
@@ -2869,8 +2869,8 @@ mod tests {
         };
 
         let document = data_file_size_stats_document(
-            "lakehouse.redapl_v3.k8s_pod_blue",
-            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            "warehouse.analytics.events",
+            "https://example.test/v1/warehouse/namespaces/analytics/tables/events",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
             &stats,
         );
@@ -2878,7 +2878,7 @@ mod tests {
         assert_eq!(
             Cell::new(vec![
                 DocumentValue::Text("Data File Size Stats: ".to_string()),
-                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+                DocumentValue::Code("warehouse.analytics.events".to_string())
             ]),
             document.title
         );
@@ -3027,8 +3027,8 @@ mod tests {
         };
 
         let document = table_data_max_document(
-            "lakehouse.redapl_v3.events",
-            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/events",
+            "warehouse.analytics.events",
+            "https://example.test/v1/warehouse/namespaces/analytics/tables/events",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
             &max,
         );
@@ -3036,7 +3036,7 @@ mod tests {
         assert_eq!(
             Cell::new(vec![
                 DocumentValue::Text("Table Data Max: ".to_string()),
-                DocumentValue::Code("lakehouse.redapl_v3.events".to_string())
+                DocumentValue::Code("warehouse.analytics.events".to_string())
             ]),
             document.title
         );
@@ -3118,8 +3118,8 @@ mod tests {
         };
 
         let document = manifest_file_list_document(
-            "lakehouse.redapl_v3.k8s_pod_blue",
-            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            "warehouse.analytics.events",
+            "https://example.test/v1/warehouse/namespaces/analytics/tables/events",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
             &manifest_files,
         );
@@ -3127,7 +3127,7 @@ mod tests {
         assert_eq!(
             Cell::new(vec![
                 DocumentValue::Text("Manifest Files: ".to_string()),
-                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+                DocumentValue::Code("warehouse.analytics.events".to_string())
             ]),
             document.title
         );
@@ -3263,8 +3263,8 @@ mod tests {
         };
 
         let document = manifest_file_detail_document(
-            "lakehouse.redapl_v3.k8s_pod_blue",
-            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            "warehouse.analytics.events",
+            "https://example.test/v1/warehouse/namespaces/analytics/tables/events",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
             &detail,
         );
@@ -3272,7 +3272,7 @@ mod tests {
         assert_eq!(
             Cell::new(vec![
                 DocumentValue::Text("Manifest File: ".to_string()),
-                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string()),
+                DocumentValue::Code("warehouse.analytics.events".to_string()),
                 DocumentValue::Text(" ".to_string()),
                 DocumentValue::Code("m1".to_string())
             ]),
@@ -3485,8 +3485,8 @@ mod tests {
         };
 
         let document = table_partitions_document(
-            "lakehouse.redapl_v3.k8s_pod_blue",
-            "https://example.test/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            "warehouse.analytics.events",
+            "https://example.test/v1/warehouse/namespaces/analytics/tables/events",
             OffsetDateTime::from_unix_timestamp(1_777_999_315).expect("valid timestamp"),
             &stats,
         );
@@ -3494,7 +3494,7 @@ mod tests {
         assert_eq!(
             Cell::new(vec![
                 DocumentValue::Text("Table Partitions: ".to_string()),
-                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string())
+                DocumentValue::Code("warehouse.analytics.events".to_string())
             ]),
             document.title
         );

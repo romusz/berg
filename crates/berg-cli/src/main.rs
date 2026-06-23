@@ -171,7 +171,7 @@ struct TableSchemaArgs {
 
 #[derive(Debug, Subcommand)]
 enum TableSchemaCommands {
-    /// Compare the current schema across datacenters.
+    /// Compare the current schema across catalog endpoints.
     Compare(CompareSchemaArgs),
     /// Show the current schema.
     Current(CurrentSchemaArgs),
@@ -179,22 +179,22 @@ enum TableSchemaCommands {
 
 #[derive(Debug, Args)]
 #[command(
-    override_usage = "berg table schema compare --catalog-uri-template <URI> [--show-schema] <table-id> <datacenters>"
+    override_usage = "berg table schema compare --catalog-uri-template <URI> [--show-schema] <table-id> <endpoint-labels>"
 )]
 struct CompareSchemaArgs {
     /// Table ID: catalog.namespace.table.
     #[arg(value_name = "table-id")]
     table: String,
 
-    /// Comma-separated datacenters to compare.
-    #[arg(value_name = "datacenters")]
-    datacenters: String,
+    /// Comma-separated endpoint labels to compare.
+    #[arg(value_name = "endpoint-labels")]
+    endpoint_labels: String,
 
-    /// REST catalog URI template. Use `{dc}` or `{datacenter}` for each datacenter.
+    /// REST catalog URI template. Use `{label}` or `{endpoint}` for each endpoint label.
     #[arg(long = "catalog-uri-template", value_name = "URI")]
     catalog_uri_template: String,
 
-    /// Print the baseline current schema when all datacenters match.
+    /// Print the baseline current schema when all endpoints match.
     #[arg(long)]
     show_schema: bool,
 }
@@ -673,8 +673,8 @@ async fn print_current_schema(
 }
 
 #[derive(Debug)]
-struct DatacenterSchema {
-    datacenter: String,
+struct EndpointSchema {
+    label: String,
     endpoint: String,
     info: CurrentSchemaInfo,
 }
@@ -694,17 +694,17 @@ async fn print_compare_schema(
     catalog_args: CatalogArgs,
 ) -> anyhow::Result<bool> {
     let table = QualifiedTableIdent::parse(&args.table)?;
-    let datacenters = parse_datacenters(&args.datacenters)?;
+    let endpoint_labels = parse_endpoint_labels(&args.endpoint_labels)?;
     let compare_config = schema_compare_config(&args, catalog_args)?;
-    let mut results = Vec::with_capacity(datacenters.len());
+    let mut results = Vec::with_capacity(endpoint_labels.len());
 
-    for datacenter in &datacenters {
+    for endpoint_label in &endpoint_labels {
         results.push(
-            load_datacenter_schema(datacenter, &table, &compare_config)
+            load_endpoint_schema(endpoint_label, &table, &compare_config)
                 .await
                 .with_context(|| {
                     format!(
-                        "failed to load current schema for `{}` in `{datacenter}`",
+                        "failed to load current schema for `{}` from endpoint `{endpoint_label}`",
                         table.display_name()
                     )
                 })?,
@@ -720,28 +720,18 @@ async fn print_compare_schema(
     }
 
     let mut output = String::new();
-    write_schema_compare_header(&mut output, &table, &datacenters);
+    write_schema_compare_header(&mut output, &table, &endpoint_labels);
     write_schema_compare_summary(&mut output, &results);
 
     if !mismatches.is_empty() {
-        write_schema_compare_result(
-            &mut output,
-            false,
-            baseline.datacenter.as_str(),
-            results.len(),
-        );
+        write_schema_compare_result(&mut output, false, baseline.label.as_str(), results.len());
         write_schema_diffs(&mut output, baseline, &mismatches)?;
         print!("{output}");
 
         return Ok(false);
     }
 
-    write_schema_compare_result(
-        &mut output,
-        true,
-        baseline.datacenter.as_str(),
-        results.len(),
-    );
+    write_schema_compare_result(&mut output, true, baseline.label.as_str(), results.len());
 
     if args.show_schema {
         write_baseline_schema_section(&mut output, &table, baseline);
@@ -755,15 +745,15 @@ async fn print_compare_schema(
 fn write_schema_compare_header(
     output: &mut String,
     table: &QualifiedTableIdent,
-    datacenters: &[String],
+    endpoint_labels: &[String],
 ) {
     writeln!(output, "# Schema Compare: `{}`", table.display_name()).expect("write to string");
     writeln!(output).expect("write to string");
     writeln!(output, "- Table: `{}`", table.display_name()).expect("write to string");
     writeln!(
         output,
-        "- Compared datacenters: `{}`",
-        datacenters.join("`, `")
+        "- Compared endpoints: `{}`",
+        endpoint_labels.join("`, `")
     )
     .expect("write to string");
     writeln!(output).expect("write to string");
@@ -772,24 +762,18 @@ fn write_schema_compare_header(
 fn write_schema_compare_result(
     output: &mut String,
     schemas_match: bool,
-    baseline_datacenter: &str,
-    datacenter_count: usize,
+    baseline_label: &str,
+    endpoint_count: usize,
 ) {
     writeln!(output, "## Result").expect("write to string");
     writeln!(output).expect("write to string");
 
     if schemas_match {
-        writeln!(
-            output,
-            "Schemas match across `{datacenter_count}` datacenters."
-        )
-        .expect("write to string");
+        writeln!(output, "Schemas match across `{endpoint_count}` endpoints.")
+            .expect("write to string");
     } else {
-        writeln!(
-            output,
-            "Schemas differ from baseline `{baseline_datacenter}`."
-        )
-        .expect("write to string");
+        writeln!(output, "Schemas differ from baseline `{baseline_label}`.")
+            .expect("write to string");
     }
 
     writeln!(output).expect("write to string");
@@ -798,9 +782,9 @@ fn write_schema_compare_result(
 fn write_baseline_schema_section(
     output: &mut String,
     table: &QualifiedTableIdent,
-    baseline: &DatacenterSchema,
+    baseline: &EndpointSchema,
 ) {
-    writeln!(output, "## Baseline Schema: `{}`", baseline.datacenter).expect("write to string");
+    writeln!(output, "## Baseline Schema: `{}`", baseline.label).expect("write to string");
     writeln!(output).expect("write to string");
 
     let document = schema_document(
@@ -812,17 +796,17 @@ fn write_baseline_schema_section(
     render_blocks_markdown(&document.blocks, 3, output);
 }
 
-async fn load_datacenter_schema(
-    datacenter: &str,
+async fn load_endpoint_schema(
+    endpoint_label: &str,
     table: &QualifiedTableIdent,
     compare_config: &SchemaCompareConfig,
-) -> anyhow::Result<DatacenterSchema> {
-    let config = datacenter_rest_catalog_config(datacenter, table, compare_config)?;
+) -> anyhow::Result<EndpointSchema> {
+    let config = endpoint_rest_catalog_config(endpoint_label, table, compare_config)?;
     let endpoint = config.table_endpoint(table.table());
     let info = load_current_schema_info(&config, table.table()).await?;
 
-    Ok(DatacenterSchema {
-        datacenter: datacenter.to_string(),
+    Ok(EndpointSchema {
+        label: endpoint_label.to_string(),
         endpoint,
         info,
     })
@@ -859,8 +843,8 @@ fn schema_compare_config(
     })
 }
 
-fn datacenter_rest_catalog_config(
-    datacenter: &str,
+fn endpoint_rest_catalog_config(
+    endpoint_label: &str,
     table: &QualifiedTableIdent,
     compare_config: &SchemaCompareConfig,
 ) -> anyhow::Result<RestCatalogConfig> {
@@ -869,7 +853,7 @@ fn datacenter_rest_catalog_config(
         .as_deref()
         .unwrap_or_else(|| table.catalog());
     let config = RestCatalogConfig::new(
-        render_datacenter_template(&compare_config.catalog_uri_template, datacenter),
+        render_endpoint_template(&compare_config.catalog_uri_template, endpoint_label),
         prefix,
         compare_config.catalog_warehouse.clone(),
         compare_config.catalog_properties.clone(),
@@ -880,33 +864,33 @@ fn datacenter_rest_catalog_config(
         .with_aws_vault_profile(compare_config.aws_vault_profile.clone()))
 }
 
-fn render_datacenter_template(template: &str, datacenter: &str) -> String {
+fn render_endpoint_template(template: &str, endpoint_label: &str) -> String {
     template
-        .replace("{datacenter}", datacenter)
-        .replace("{dc}", datacenter)
+        .replace("{endpoint}", endpoint_label)
+        .replace("{label}", endpoint_label)
 }
 
-fn parse_datacenters(value: &str) -> anyhow::Result<Vec<String>> {
-    let datacenters = value
+fn parse_endpoint_labels(value: &str) -> anyhow::Result<Vec<String>> {
+    let endpoint_labels = value
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect::<Vec<_>>();
 
-    if datacenters.len() < 2 {
-        anyhow::bail!("provide at least two datacenters");
+    if endpoint_labels.len() < 2 {
+        anyhow::bail!("provide at least two endpoint labels");
     }
 
-    Ok(datacenters)
+    Ok(endpoint_labels)
 }
 
-fn write_schema_compare_summary(output: &mut String, results: &[DatacenterSchema]) {
-    writeln!(output, "## Datacenter Summary").expect("write to string");
+fn write_schema_compare_summary(output: &mut String, results: &[EndpointSchema]) {
+    writeln!(output, "## Endpoint Summary").expect("write to string");
     writeln!(output).expect("write to string");
     writeln!(
         output,
-        "| Datacenter | Schema ID | Fields | Metadata location |"
+        "| Endpoint | Schema ID | Fields | Metadata location |"
     )
     .expect("write to string");
     writeln!(output, "| --- | ---: | ---: | --- |").expect("write to string");
@@ -915,7 +899,7 @@ fn write_schema_compare_summary(output: &mut String, results: &[DatacenterSchema
         writeln!(
             output,
             "| `{}` | `{}` | `{}` | `{}` |",
-            escape_markdown_table_cell(&result.datacenter),
+            escape_markdown_table_cell(&result.label),
             result.info.current_schema_id,
             result.info.schema.as_struct().fields().len(),
             escape_markdown_table_cell(&result.info.metadata_json_path)
@@ -928,8 +912,8 @@ fn write_schema_compare_summary(output: &mut String, results: &[DatacenterSchema
 
 fn write_schema_diffs(
     output: &mut String,
-    baseline: &DatacenterSchema,
-    others: &[&DatacenterSchema],
+    baseline: &EndpointSchema,
+    others: &[&EndpointSchema],
 ) -> anyhow::Result<()> {
     let baseline_text = canonical_schema_text(baseline.info.schema.as_ref())?;
 
@@ -937,17 +921,12 @@ fn write_schema_diffs(
 
     for other in others {
         writeln!(output).expect("write to string");
-        writeln!(
-            output,
-            "### `{}` vs `{}`",
-            baseline.datacenter, other.datacenter
-        )
-        .expect("write to string");
+        writeln!(output, "### `{}` vs `{}`", baseline.label, other.label).expect("write to string");
         writeln!(output).expect("write to string");
         writeln!(output, "```diff").expect("write to string");
         output.push_str(&unified_diff(
-            &baseline.datacenter,
-            &other.datacenter,
+            &baseline.label,
+            &other.label,
             &baseline_text,
             &canonical_schema_text(other.info.schema.as_ref())?,
         ));
@@ -2148,10 +2127,10 @@ mod tests {
     use berg_core::spec::Schema;
 
     use super::{
-        ApplicabilityStatus, Cell, ConfidenceStatus, DatacenterSchema, DeltaDirection,
-        DocumentFormat, DocumentValue, Presence, Status, SupportStatus, UnknownValueKind,
-        command_tree, incomplete_command_help, parse_datacenters, render_datacenter_template,
-        render_document, render_document_markdown, unified_diff, write_schema_compare_header,
+        ApplicabilityStatus, Cell, ConfidenceStatus, DeltaDirection, DocumentFormat, DocumentValue,
+        EndpointSchema, Presence, Status, SupportStatus, UnknownValueKind, command_tree,
+        incomplete_command_help, parse_endpoint_labels, render_document, render_document_markdown,
+        render_endpoint_template, unified_diff, write_schema_compare_header,
         write_schema_compare_result, write_schema_compare_summary,
     };
 
@@ -2164,7 +2143,7 @@ mod tests {
         let document = Document {
             title: Cell::new(vec![
                 DocumentValue::Text("Schema: ".to_string()),
-                DocumentValue::Code("lakehouse.redapl_v3.k8s_pod_blue".to_string()),
+                DocumentValue::Code("warehouse.analytics.events".to_string()),
             ]),
             blocks: vec![
                 Block::Properties(vec![
@@ -2248,7 +2227,7 @@ mod tests {
 
         let markdown = render_document_markdown(&document);
 
-        assert!(markdown.contains("# Schema: `lakehouse.redapl_v3.k8s_pod_blue`"));
+        assert!(markdown.contains("# Schema: `warehouse.analytics.events`"));
         assert!(markdown.contains("- Source endpoint: `https://example.test/catalog`"));
         assert!(markdown.contains("- Schema ID: `3`"));
         assert!(markdown.contains("- Data files: `7`"));
@@ -2578,7 +2557,9 @@ mod tests {
         );
         assert!(tree.contains("│   ├── schema - Inspect table schemas"));
         assert!(
-            tree.contains("│   │   ├── compare - Compare the current schema across datacenters")
+            tree.contains(
+                "│   │   ├── compare - Compare the current schema across catalog endpoints"
+            )
         );
         assert!(tree.contains("│   │   └── current - Show the current schema"));
         assert!(tree.contains("│   ├── snapshots - Inspect table snapshots"));
@@ -2592,37 +2573,39 @@ mod tests {
     }
 
     #[test]
-    fn parses_schema_compare_datacenters() {
-        let datacenters =
-            parse_datacenters("dc1.prod, dc2.prod,dc3.staging").expect("valid datacenters");
+    fn parses_schema_compare_endpoint_labels() {
+        let endpoint_labels =
+            parse_endpoint_labels("east, west,central").expect("valid endpoint labels");
 
-        assert_eq!(datacenters, vec!["dc1.prod", "dc2.prod", "dc3.staging"]);
+        assert_eq!(endpoint_labels, vec!["east", "west", "central"]);
     }
 
     #[test]
-    fn rejects_schema_compare_with_less_than_two_datacenters() {
-        let err = parse_datacenters("dc1.prod").expect_err("requires at least two datacenters");
+    fn rejects_schema_compare_with_less_than_two_endpoint_labels() {
+        let err = parse_endpoint_labels("east").expect_err("requires at least two endpoint labels");
 
         assert!(err.to_string().contains("at least two"));
     }
 
     #[test]
-    fn renders_datacenter_template() {
+    fn renders_endpoint_template() {
         let rendered =
-            render_datacenter_template("https://catalog-{dc}.example.com/{datacenter}", "dc1.prod");
+            render_endpoint_template("https://catalog-{label}.example.com/{endpoint}", "east");
 
-        assert_eq!(rendered, "https://catalog-dc1.prod.example.com/dc1.prod");
+        assert_eq!(rendered, "https://catalog-east.example.com/east");
     }
 
     #[test]
     fn renders_schema_compare_summary_as_markdown() {
-        let table = super::QualifiedTableIdent::parse("lakehouse.ns.tbl").expect("valid table");
-        let datacenters = vec!["dc1".to_string(), "dc2".to_string()];
+        let table =
+            super::QualifiedTableIdent::parse("warehouse.analytics.events").expect("valid table");
+        let endpoint_labels = vec!["east".to_string(), "west".to_string()];
         let schema = Arc::new(Schema::builder().with_schema_id(7).build().expect("schema"));
-        let results = [DatacenterSchema {
-            datacenter: "dc1".to_string(),
-            endpoint: "https://catalog-dc1.example.com/v1/lakehouse/namespaces/ns/tables/tbl"
-                .to_string(),
+        let results = [EndpointSchema {
+            label: "east".to_string(),
+            endpoint:
+                "https://catalog-east.example.com/v1/warehouse/namespaces/analytics/tables/events"
+                    .to_string(),
             info: CurrentSchemaInfo {
                 metadata_json_path: "s3://bucket/metadata.json".to_string(),
                 table_location: "s3://bucket/table".to_string(),
@@ -2632,17 +2615,17 @@ mod tests {
         }];
         let mut markdown = String::new();
 
-        write_schema_compare_header(&mut markdown, &table, &datacenters);
+        write_schema_compare_header(&mut markdown, &table, &endpoint_labels);
         write_schema_compare_summary(&mut markdown, &results);
-        write_schema_compare_result(&mut markdown, true, "dc1", 2);
+        write_schema_compare_result(&mut markdown, true, "east", 2);
 
-        assert!(markdown.contains("# Schema Compare: `lakehouse.ns.tbl`"));
-        assert!(markdown.contains("- Compared datacenters: `dc1`, `dc2`"));
-        assert!(markdown.contains("## Datacenter Summary"));
-        assert!(markdown.contains("| Datacenter | Schema ID | Fields | Metadata location |"));
-        assert!(markdown.contains("| `dc1` | `7` | `0` | `s3://bucket/metadata.json` |"));
+        assert!(markdown.contains("# Schema Compare: `warehouse.analytics.events`"));
+        assert!(markdown.contains("- Compared endpoints: `east`, `west`"));
+        assert!(markdown.contains("## Endpoint Summary"));
+        assert!(markdown.contains("| Endpoint | Schema ID | Fields | Metadata location |"));
+        assert!(markdown.contains("| `east` | `7` | `0` | `s3://bucket/metadata.json` |"));
         assert!(markdown.contains("## Result"));
-        assert!(markdown.contains("Schemas match across `2` datacenters."));
+        assert!(markdown.contains("Schemas match across `2` endpoints."));
     }
 
     #[test]
@@ -2662,7 +2645,7 @@ mod tests {
         let help = incomplete_command_help(&args([
             "table",
             "manifest",
-            "lakehouse.redapl_v3.k8s_pod_blue",
+            "warehouse.analytics.events",
             "--catalog-uri=https://example.test",
         ]))
         .expect("manifest help");
@@ -2678,9 +2661,9 @@ mod tests {
             "table",
             "manifest",
             "files",
-            "lakehouse.redapl_v3.k8s_pod_blue",
+            "warehouse.analytics.events",
             "--aws-vault-profile",
-            "sso-prod-engineering",
+            "example-profile",
         ]))
         .expect("manifest files help");
 
@@ -2695,7 +2678,7 @@ mod tests {
             "table",
             "data",
             "files",
-            "lakehouse.redapl_v3.k8s_pod_blue",
+            "warehouse.analytics.events",
             "--catalog-uri=https://example.test",
         ]))
         .expect("data files help");
@@ -2710,7 +2693,7 @@ mod tests {
             "table",
             "data",
             "max",
-            "lakehouse.redapl_v3.k8s_pod_blue",
+            "warehouse.analytics.events",
             "event_id",
             "--catalog-uri=https://example.test",
         ]))
@@ -2724,7 +2707,7 @@ mod tests {
     fn renders_parent_help_for_incomplete_table_command() {
         let help = incomplete_command_help(&args([
             "table",
-            "lakehouse.redapl_v3.k8s_pod_blue",
+            "warehouse.analytics.events",
             "--catalog-uri=https://example.test",
         ]))
         .expect("table help");

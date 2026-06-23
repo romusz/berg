@@ -3843,34 +3843,34 @@ mod tests {
 
     #[test]
     fn parses_catalog_namespace_table() {
-        let table = QualifiedTableIdent::parse("lakehouse.redapl_v3.k8s_pod_blue")
-            .expect("valid table ident");
+        let table =
+            QualifiedTableIdent::parse("warehouse.analytics.events").expect("valid table ident");
 
-        assert_eq!("lakehouse", table.catalog());
-        assert_eq!("redapl_v3.k8s_pod_blue", table.table().to_string());
-        assert_eq!("lakehouse.redapl_v3.k8s_pod_blue", table.display_name());
+        assert_eq!("warehouse", table.catalog());
+        assert_eq!("analytics.events", table.table().to_string());
+        assert_eq!("warehouse.analytics.events", table.display_name());
     }
 
     #[test]
     fn parses_nested_namespaces() {
-        let table = QualifiedTableIdent::parse("lakehouse.a.b.c")
+        let table = QualifiedTableIdent::parse("warehouse.a.b.c")
             .expect("valid nested namespace table ident");
 
-        assert_eq!("lakehouse", table.catalog());
+        assert_eq!("warehouse", table.catalog());
         assert_eq!("a.b.c", table.table().to_string());
     }
 
     #[test]
     fn rejects_missing_catalog_segment() {
-        assert!(QualifiedTableIdent::parse("redapl_v3.k8s_pod_blue").is_err());
+        assert!(QualifiedTableIdent::parse("analytics.events").is_err());
     }
 
     #[test]
     fn builds_table_endpoint() {
-        let table = QualifiedTableIdent::parse("lakehouse.redapl_v3.k8s_pod_blue")
-            .expect("valid table ident");
+        let table =
+            QualifiedTableIdent::parse("warehouse.analytics.events").expect("valid table ident");
         let config = RestCatalogConfig::new(
-            "https://lakehouse-gateway.us1.staging.dog/internal/catalog/",
+            "https://catalog.example.test/api/catalog/",
             table.catalog(),
             None,
             HashMap::default(),
@@ -3878,7 +3878,7 @@ mod tests {
         .expect("valid config");
 
         assert_eq!(
-            "https://lakehouse-gateway.us1.staging.dog/internal/catalog/v1/lakehouse/namespaces/redapl_v3/tables/k8s_pod_blue",
+            "https://catalog.example.test/api/catalog/v1/warehouse/namespaces/analytics/tables/events",
             config.table_endpoint(table.table())
         );
     }

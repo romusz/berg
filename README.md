@@ -72,8 +72,8 @@ Compare a table schema across REST catalog endpoints:
 
 ```sh
 berg \
-  --catalog-uri-template 'https://catalog-{dc}.example.com' \
-  table schema compare warehouse.db.table dc1,dc2 --show-schema
+  --catalog-uri-template 'https://catalog-{label}.example.com' \
+  table schema compare warehouse.db.table east,west --show-schema
 ```
 
 Inspect current snapshot statistics:
@@ -153,13 +153,13 @@ berg \
   table partitions current warehouse.db.table
 ```
 
-`table schema compare` accepts one comma-separated list of datacenter or endpoint
-labels and renders `--catalog-uri-template` once per label. Templates support
-`{dc}` and `{datacenter}` for the full label. Authentication uses the normal
+`table schema compare` accepts one comma-separated list of endpoint labels and
+renders `--catalog-uri-template` once per label. Templates support `{label}` and
+`{endpoint}` for the full label. Authentication uses the normal
 catalog configuration flags and environment variables, such as `--catalog-token`,
 `--catalog-credential`, `--catalog-header`, and `--catalog-property`.
 Pass `--show-schema` to print the baseline current schema when all compared
-datacenters match.
+endpoints match.
 
 ## Output Formats
 

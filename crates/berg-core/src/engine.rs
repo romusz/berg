@@ -22,18 +22,23 @@
 //!
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, LargeStringArray, StringArray, StringViewArray};
 use async_trait::async_trait;
 use aws_credential_types::provider::ProvideCredentials;
+use bytes::Bytes;
 use flate2::write::GzDecoder;
-use iceberg::io::{InputFile, StorageFactory};
+use iceberg::io::{
+    CLIENT_REGION, FileMetadata, FileRead, FileWrite, InputFile, OutputFile, S3_ENDPOINT,
+    S3_REGION, Storage, StorageConfig, StorageFactory,
+};
 use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType};
 use iceberg::table::Table;
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
+use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
 };
@@ -129,6 +134,29 @@ struct AwsProfileCredentialLoader {
 #[derive(Debug)]
 struct AwsVaultCredentialLoader {
     profile: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct AutoRegionS3StorageFactory {
+    configured_scheme: String,
+    #[serde(skip)]
+    customized_credential_load: Option<CustomAwsCredentialLoader>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct AutoRegionS3Storage {
+    configured_scheme: String,
+    #[serde(skip)]
+    customized_credential_load: Option<CustomAwsCredentialLoader>,
+    config: StorageConfig,
+    #[serde(skip)]
+    cache: Arc<Mutex<HashMap<String, Arc<dyn Storage>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct S3BucketLocation {
+    region: String,
+    endpoint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3685,7 +3713,7 @@ async fn load_rest_catalog(config: &RestCatalogConfig) -> Result<RestCatalog> {
                     }))
                 }
             });
-    let storage_factory: Arc<dyn StorageFactory> = Arc::new(OpenDalStorageFactory::S3 {
+    let storage_factory: Arc<dyn StorageFactory> = Arc::new(AutoRegionS3StorageFactory {
         configured_scheme: "s3".to_string(),
         customized_credential_load,
     });
@@ -3694,6 +3722,236 @@ async fn load_rest_catalog(config: &RestCatalogConfig) -> Result<RestCatalog> {
         .with_storage_factory(storage_factory)
         .load("berg", config.catalog_properties())
         .await?)
+}
+
+#[typetag::serde(name = "AutoRegionS3StorageFactory")]
+impl StorageFactory for AutoRegionS3StorageFactory {
+    fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
+        Ok(Arc::new(AutoRegionS3Storage {
+            configured_scheme: self.configured_scheme.clone(),
+            customized_credential_load: self.customized_credential_load.clone(),
+            config: config.clone(),
+            cache: Arc::default(),
+        }))
+    }
+}
+
+impl fmt::Debug for AutoRegionS3Storage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AutoRegionS3Storage")
+            .field("configured_scheme", &self.configured_scheme)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+#[typetag::serde(name = "AutoRegionS3Storage")]
+impl Storage for AutoRegionS3Storage {
+    async fn exists(&self, path: &str) -> iceberg::Result<bool> {
+        self.storage_for_path(path).await?.exists(path).await
+    }
+
+    async fn metadata(&self, path: &str) -> iceberg::Result<FileMetadata> {
+        self.storage_for_path(path).await?.metadata(path).await
+    }
+
+    async fn read(&self, path: &str) -> iceberg::Result<Bytes> {
+        self.storage_for_path(path).await?.read(path).await
+    }
+
+    async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn FileRead>> {
+        self.storage_for_path(path).await?.reader(path).await
+    }
+
+    async fn write(&self, path: &str, bs: Bytes) -> iceberg::Result<()> {
+        self.storage_for_path(path).await?.write(path, bs).await
+    }
+
+    async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn FileWrite>> {
+        self.storage_for_path(path).await?.writer(path).await
+    }
+
+    async fn delete(&self, path: &str) -> iceberg::Result<()> {
+        self.storage_for_path(path).await?.delete(path).await
+    }
+
+    async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
+        self.storage_for_path(path).await?.delete_prefix(path).await
+    }
+
+    fn new_input(&self, path: &str) -> iceberg::Result<InputFile> {
+        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+
+    fn new_output(&self, path: &str) -> iceberg::Result<OutputFile> {
+        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+}
+
+impl AutoRegionS3Storage {
+    async fn storage_for_path(&self, path: &str) -> iceberg::Result<Arc<dyn Storage>> {
+        let Some(bucket) = s3_bucket_from_path(path, &self.configured_scheme) else {
+            return self.build_storage(&self.config);
+        };
+
+        if let Some(storage) = self.cached_storage(bucket)? {
+            return Ok(storage);
+        }
+
+        let config = self.config_for_bucket(bucket).await;
+        let storage = self.build_storage(&config)?;
+        let mut cache = self.cache.lock().map_err(cache_lock_error)?;
+
+        Ok(cache
+            .entry(bucket.to_string())
+            .or_insert_with(|| storage.clone())
+            .clone())
+    }
+
+    fn cached_storage(&self, bucket: &str) -> iceberg::Result<Option<Arc<dyn Storage>>> {
+        Ok(self
+            .cache
+            .lock()
+            .map_err(cache_lock_error)?
+            .get(bucket)
+            .cloned())
+    }
+
+    fn build_storage(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
+        OpenDalStorageFactory::S3 {
+            configured_scheme: self.configured_scheme.clone(),
+            customized_credential_load: self.customized_credential_load.clone(),
+        }
+        .build(config)
+    }
+
+    async fn config_for_bucket(&self, bucket: &str) -> StorageConfig {
+        if s3_region_is_explicit(self.config.props()) {
+            return self.config.clone();
+        }
+
+        let Some(location) = discover_s3_bucket_location(bucket, self.config.props()).await else {
+            return self.config.clone();
+        };
+
+        storage_config_with_s3_bucket_location(&self.config, location)
+    }
+}
+
+fn cache_lock_error<T>(_: std::sync::PoisonError<T>) -> iceberg::Error {
+    iceberg::Error::new(ErrorKind::Unexpected, "S3 storage cache lock was poisoned")
+}
+
+fn s3_region_is_explicit(props: &HashMap<String, String>) -> bool {
+    props.contains_key(S3_REGION) || props.contains_key(CLIENT_REGION)
+}
+
+fn storage_config_with_s3_bucket_location(
+    config: &StorageConfig,
+    location: S3BucketLocation,
+) -> StorageConfig {
+    let mut props = config.props().clone();
+    props.insert(S3_REGION.to_string(), location.region);
+    props
+        .entry(S3_ENDPOINT.to_string())
+        .or_insert(location.endpoint);
+    StorageConfig::from_props(props)
+}
+
+fn s3_bucket_from_path<'a>(path: &'a str, configured_scheme: &str) -> Option<&'a str> {
+    let prefix = format!("{configured_scheme}://");
+    let rest = path.strip_prefix(&prefix)?;
+    let bucket = rest.split('/').next()?;
+
+    if bucket.is_empty() {
+        None
+    } else {
+        Some(bucket)
+    }
+}
+
+async fn discover_s3_bucket_location(
+    bucket: &str,
+    props: &HashMap<String, String>,
+) -> Option<S3BucketLocation> {
+    let client = Client::new();
+
+    for endpoint in s3_region_probe_endpoints(props) {
+        if let Some(region) = probe_s3_bucket_region(&client, &endpoint, bucket).await {
+            return Some(S3BucketLocation { region, endpoint });
+        }
+    }
+
+    None
+}
+
+async fn probe_s3_bucket_region(client: &Client, endpoint: &str, bucket: &str) -> Option<String> {
+    let url = format!("{}/{}", endpoint.trim_end_matches('/'), bucket);
+    let response = client.head(url).send().await.ok()?;
+
+    response
+        .headers()
+        .get("x-amz-bucket-region")
+        .and_then(|header| header.to_str().ok())
+        .filter(|region| !region.is_empty())
+        .map(ToString::to_string)
+}
+
+fn s3_region_probe_endpoints(props: &HashMap<String, String>) -> Vec<String> {
+    let mut endpoints = Vec::new();
+
+    if let Some(endpoint) = props.get(S3_ENDPOINT) {
+        push_unique_endpoint(&mut endpoints, endpoint);
+        return endpoints;
+    }
+
+    for env_var_name in ["AWS_ENDPOINT_URL", "AWS_ENDPOINT", "AWS_S3_ENDPOINT"] {
+        if let Ok(endpoint) = std::env::var(env_var_name) {
+            push_unique_endpoint(&mut endpoints, &endpoint);
+        }
+    }
+
+    if !endpoints.is_empty() {
+        return endpoints;
+    }
+
+    for env_var_name in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
+        if let Ok(region) = std::env::var(env_var_name)
+            && !region.is_empty()
+        {
+            push_unique_endpoint(&mut endpoints, &s3_endpoint_for_region(&region));
+        }
+    }
+
+    for endpoint in [
+        "https://s3.amazonaws.com",
+        "https://s3.us-east-1.amazonaws.com",
+        "https://s3.us-gov-west-1.amazonaws.com",
+        "https://s3.us-gov-east-1.amazonaws.com",
+        "https://s3.cn-north-1.amazonaws.com.cn",
+        "https://s3.cn-northwest-1.amazonaws.com.cn",
+    ] {
+        push_unique_endpoint(&mut endpoints, endpoint);
+    }
+
+    endpoints
+}
+
+fn push_unique_endpoint(endpoints: &mut Vec<String>, endpoint: &str) {
+    let endpoint = endpoint.trim_end_matches('/').to_string();
+
+    if !endpoint.is_empty() && !endpoints.contains(&endpoint) {
+        endpoints.push(endpoint);
+    }
+}
+
+fn s3_endpoint_for_region(region: &str) -> String {
+    if region.starts_with("cn-") {
+        format!("https://s3.{region}.amazonaws.com.cn")
+    } else {
+        format!("https://s3.{region}.amazonaws.com")
+    }
 }
 
 #[async_trait]
@@ -3833,12 +4091,14 @@ mod tests {
         CurrentTablePartitionDistribution, CurrentTablePartitionStats, DataFileSizeDistribution,
         DeleteFileInfo, DeleteImpact, MaxConfidence, PartitionAccumulator,
         PartitionMetricDistribution, QualifiedTableIdent, ReadCompleteness, RestCatalogConfig,
-        TypeCompatibility, collect_delete_files, credential_from_env_output,
-        data_file_size_buckets, data_file_size_distribution, find_manifest_file_by_id,
-        is_compressed_metadata_json, manifest_file_list_entries, manifest_partition_metadata,
-        max_precision, metadata_json_size, parse_catalog_property, partition_distribution,
-        partition_path, partition_stats_from_accumulators, read_parquet_position_delete_file_paths,
-        resolve_current_column_path, rounded_average, schema_field_paths,
+        S3_ENDPOINT, S3_REGION, S3BucketLocation, StorageConfig, TypeCompatibility,
+        collect_delete_files, credential_from_env_output, data_file_size_buckets,
+        data_file_size_distribution, find_manifest_file_by_id, is_compressed_metadata_json,
+        manifest_file_list_entries, manifest_partition_metadata, max_precision, metadata_json_size,
+        parse_catalog_property, partition_distribution, partition_path,
+        partition_stats_from_accumulators, read_parquet_position_delete_file_paths,
+        resolve_current_column_path, rounded_average, s3_bucket_from_path, s3_endpoint_for_region,
+        s3_region_probe_endpoints, schema_field_paths, storage_config_with_s3_bucket_location,
     };
 
     #[test]
@@ -3907,6 +4167,80 @@ AWS_SESSION_TOKEN='token'
         assert_eq!("access", credential.access_key_id);
         assert_eq!("secret", credential.secret_access_key);
         assert_eq!(Some("token".to_string()), credential.session_token);
+    }
+
+    #[test]
+    fn parses_s3_bucket_from_path() {
+        assert_eq!(
+            Some("bucket"),
+            s3_bucket_from_path("s3://bucket/path/to/file.avro", "s3")
+        );
+        assert_eq!(None, s3_bucket_from_path("s3:///path/to/file.avro", "s3"));
+        assert_eq!(None, s3_bucket_from_path("s3a://bucket/path", "s3"));
+    }
+
+    #[test]
+    fn builds_partition_specific_s3_endpoints() {
+        assert_eq!(
+            "https://s3.us-west-2.amazonaws.com",
+            s3_endpoint_for_region("us-west-2")
+        );
+        assert_eq!(
+            "https://s3.us-gov-west-1.amazonaws.com",
+            s3_endpoint_for_region("us-gov-west-1")
+        );
+        assert_eq!(
+            "https://s3.cn-north-1.amazonaws.com.cn",
+            s3_endpoint_for_region("cn-north-1")
+        );
+    }
+
+    #[test]
+    fn explicit_s3_endpoint_limits_region_probe_endpoints() {
+        let mut props = HashMap::new();
+        props.insert(
+            S3_ENDPOINT.to_string(),
+            "https://minio.example.test/".to_string(),
+        );
+
+        assert_eq!(
+            vec!["https://minio.example.test".to_string()],
+            s3_region_probe_endpoints(&props)
+        );
+    }
+
+    #[test]
+    fn discovered_s3_location_updates_storage_config_without_overriding_endpoint() {
+        let config = StorageConfig::new()
+            .with_prop(S3_ENDPOINT, "https://s3-control-plane-proxy.example.test");
+        let location = S3BucketLocation {
+            region: "us-gov-west-1".to_string(),
+            endpoint: "https://s3.us-gov-west-1.amazonaws.com".to_string(),
+        };
+
+        let config = storage_config_with_s3_bucket_location(&config, location);
+
+        assert_eq!(Some(&"us-gov-west-1".to_string()), config.get(S3_REGION));
+        assert_eq!(
+            Some(&"https://s3-control-plane-proxy.example.test".to_string()),
+            config.get(S3_ENDPOINT)
+        );
+    }
+
+    #[test]
+    fn discovered_s3_location_sets_endpoint_when_absent() {
+        let location = S3BucketLocation {
+            region: "us-gov-west-1".to_string(),
+            endpoint: "https://s3.us-gov-west-1.amazonaws.com".to_string(),
+        };
+
+        let config = storage_config_with_s3_bucket_location(&StorageConfig::new(), location);
+
+        assert_eq!(Some(&"us-gov-west-1".to_string()), config.get(S3_REGION));
+        assert_eq!(
+            Some(&"https://s3.us-gov-west-1.amazonaws.com".to_string()),
+            config.get(S3_ENDPOINT)
+        );
     }
 
     #[test]

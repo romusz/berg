@@ -16,15 +16,18 @@ arrow-array.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
+bytes.workspace = true
 flate2.workspace = true
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-storage-opendal.workspace = true
 parquet.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+typetag.workspace = true
 
 [dev-dependencies]
 arrow-schema.workspace = true

@@ -802,15 +802,18 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
+ "bytes",
  "flate2",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
  "parquet",
  "reqwest",
+ "serde",
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "typetag",
 ]
 
 [[package]]

@@ -14,12 +14,13 @@ use berg_core::engine::{
     load_current_manifest_file_detail, load_current_manifest_file_list, load_current_schema,
     load_current_schema_info, load_current_table_max, load_current_table_partitions,
     load_current_table_properties, load_current_table_stats, load_table_snapshot_list,
-    parse_catalog_property,
+    parse_catalog_property, search_table_names,
 };
 use berg_core::report::{
     data_file_size_stats_document, manifest_file_detail_document, manifest_file_list_document,
-    schema_document, table_data_max_document, table_partitions_document, table_properties_document,
-    table_snapshot_list_document, table_stats_document,
+    schema_document, table_data_max_document, table_name_search_document,
+    table_partitions_document, table_properties_document, table_snapshot_list_document,
+    table_stats_document,
 };
 use berg_core::spec;
 use clap::error::ErrorKind;
@@ -37,7 +38,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct CatalogArgs {
     /// Iceberg REST catalog base URI. Overrides `BERG_CATALOG_URI`.
     #[arg(
@@ -151,6 +152,8 @@ enum TableCommands {
     Data(TableDataArgs),
     /// Inspect table manifests.
     Manifest(TableManifestArgs),
+    /// Search table names.
+    Name(TableNameArgs),
     /// Inspect table partitions.
     Partitions(TablePartitionsArgs),
     /// Inspect table properties.
@@ -161,6 +164,43 @@ enum TableCommands {
     Snapshots(TableSnapshotsArgs),
     /// Inspect table statistics.
     Stats(TableStatsArgs),
+}
+
+#[derive(Debug, Args)]
+struct TableNameArgs {
+    #[command(subcommand)]
+    command: TableNameCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum TableNameCommands {
+    /// Search tables by table-name substring.
+    Search(TableNameSearchArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    override_usage = "berg table name search [--details] <catalog-prefix> <table-substring> [namespace-substring]"
+)]
+struct TableNameSearchArgs {
+    /// REST catalog prefix to search.
+    #[arg(value_name = "catalog-prefix")]
+    catalog_prefix: String,
+
+    /// Substring to match against table names.
+    #[arg(value_name = "table-substring")]
+    table_substring: String,
+
+    /// Optional substring to match against dotted namespace names.
+    #[arg(value_name = "namespace-substring")]
+    namespace_substring: Option<String>,
+
+    /// Load matched tables and include table metadata details without reading manifests or data files.
+    #[arg(long)]
+    details: bool,
+
+    #[command(flatten)]
+    output: DocumentOutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -454,6 +494,11 @@ async fn main() -> anyhow::Result<()> {
                     print_manifest_files(files_args, catalog_args).await?;
                 }
             },
+            TableCommands::Name(name_args) => match name_args.command {
+                TableNameCommands::Search(args) => {
+                    print_table_name_search(args, catalog_args).await?;
+                }
+            },
             TableCommands::Partitions(partitions_args) => match partitions_args.command {
                 TablePartitionsCommands::Current(args) => {
                     print_current_table_partitions(args, catalog_args).await?;
@@ -666,6 +711,31 @@ async fn print_current_schema(
         OffsetDateTime::now_utc(),
         schema,
     );
+
+    print!("{}", render_document(&document, args.output.format)?);
+
+    Ok(())
+}
+
+async fn print_table_name_search(
+    args: TableNameSearchArgs,
+    catalog_args: CatalogArgs,
+) -> anyhow::Result<()> {
+    let config = rest_catalog_config_for_prefix(catalog_args, args.catalog_prefix.clone())?;
+    let search = search_table_names(
+        &config,
+        &args.table_substring,
+        args.namespace_substring.as_deref(),
+        args.details,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to search table names under catalog prefix `{}`",
+            args.catalog_prefix
+        )
+    })?;
+    let document = table_name_search_document(&search);
 
     print!("{}", render_document(&document, args.output.format)?);
 
@@ -1266,10 +1336,19 @@ fn rest_catalog_config(
     catalog_args: CatalogArgs,
     table: &QualifiedTableIdent,
 ) -> anyhow::Result<RestCatalogConfig> {
+    let catalog_prefix =
+        first_configured_value(catalog_args.prefix.clone(), "BERG_CATALOG_PREFIX")?
+            .unwrap_or_else(|| table.catalog().to_string());
+
+    rest_catalog_config_for_prefix(catalog_args, catalog_prefix)
+}
+
+fn rest_catalog_config_for_prefix(
+    catalog_args: CatalogArgs,
+    catalog_prefix: String,
+) -> anyhow::Result<RestCatalogConfig> {
     let catalog_uri = first_configured_value(catalog_args.uri, "BERG_CATALOG_URI")?
         .ok_or(berg_core::BergError::MissingCatalogUri)?;
-    let catalog_prefix = first_configured_value(catalog_args.prefix, "BERG_CATALOG_PREFIX")?
-        .unwrap_or_else(|| table.catalog().to_string());
     let catalog_warehouse =
         first_configured_value(catalog_args.warehouse, "BERG_CATALOG_WAREHOUSE")?;
     let catalog_token = first_configured_value(catalog_args.token, "BERG_CATALOG_TOKEN")?;
@@ -1564,10 +1643,9 @@ fn render_binary_size_table_header_markdown(table: &Table, column_index: usize) 
         .get(column_index)
         .map_or_else(String::new, render_cell_markdown);
 
-    if label == "Size" || label == "Binary size" {
-        "Binary size".to_string()
-    } else {
-        format!("{label} (binary)")
+    match label.as_str() {
+        "Size" | "Binary size" => "Binary size".to_string(),
+        _ => format!("{label} (binary)"),
     }
 }
 
@@ -1699,6 +1777,8 @@ fn is_numeric_table_cell(cell: &Cell) -> bool {
         [DocumentValue::Number(_)
             | DocumentValue::Unsigned(_)
             | DocumentValue::Bytes(_)
+            | DocumentValue::BinarySize(_)
+            | DocumentValue::Blank
             | DocumentValue::Delta { .. }
             | DocumentValue::ChangeSummary { .. }
             | DocumentValue::PercentageMillis(_)
@@ -1731,7 +1811,7 @@ fn is_bytes_table_cell(cell: &Cell) -> bool {
 fn is_bytes_or_missing_table_cell(cell: &Cell) -> bool {
     matches!(
         cell.values.as_slice(),
-        [DocumentValue::Bytes(_) | DocumentValue::MissingValue]
+        [DocumentValue::Bytes(_) | DocumentValue::MissingValue | DocumentValue::Blank]
     )
 }
 
@@ -1748,7 +1828,7 @@ fn is_binary_size_table_column(table: &Table, column_index: usize) -> bool {
     table
         .columns
         .get(column_index)
-        .is_some_and(|column| render_cell_markdown(column) == "Binary size")
+        .is_some_and(|column| matches!(render_cell_markdown(column).as_str(), "Binary size"))
 }
 
 fn render_list_markdown(list: &List, heading_level: usize, markdown: &mut String) {
@@ -1810,6 +1890,7 @@ fn render_cell_markdown(cell: &Cell) -> String {
 
 fn render_document_value_markdown(value: &DocumentValue) -> String {
     match value {
+        DocumentValue::Blank => String::new(),
         DocumentValue::Text(value) => value.clone(),
         DocumentValue::Code(value) => format!("`{value}`"),
         DocumentValue::Uri(value) => render_uri_markdown(value),
@@ -1818,6 +1899,7 @@ fn render_document_value_markdown(value: &DocumentValue) -> String {
         DocumentValue::Number(value) => format!("`{value}`"),
         DocumentValue::Unsigned(value) => format!("`{}`", format_u64(*value)),
         DocumentValue::Bytes(value) => render_bytes_markdown(*value),
+        DocumentValue::BinarySize(value) => render_binary_size_markdown(*value),
         DocumentValue::Delta { direction, value } => render_delta_markdown(*direction, *value),
         DocumentValue::ChangeSummary {
             positive,
@@ -2299,6 +2381,35 @@ mod tests {
     }
 
     #[test]
+    fn renders_data_size_table_cells_as_binary_size_with_blank_values() {
+        let document = Document {
+            title: Cell::text("Table Name Search"),
+            blocks: vec![Block::Table(Table {
+                columns: vec![
+                    Cell::text("ID"),
+                    Cell::text("Row Count"),
+                    Cell::text("Data Size"),
+                ],
+                rows: vec![Row {
+                    cells: vec![
+                        Cell::code("analytics.events"),
+                        Cell::blank(),
+                        Cell::value(DocumentValue::BinarySize(42 * 1024 * 1024)),
+                    ],
+                }],
+            })],
+        };
+
+        let markdown = render_document_markdown(&document);
+
+        assert!(markdown.contains("| ID | Row Count | Data Size |"));
+        assert!(markdown.contains("| --- | ---: | ---: |"));
+        assert!(markdown.contains("| `analytics.events` |  | `42.000 MiB` |"));
+        assert!(!markdown.contains("Data Size (bytes)"));
+        assert!(!markdown.contains("Data Size (binary)"));
+    }
+
+    #[test]
     fn renders_missing_values_as_question_marks() {
         let document = Document {
             title: Cell::text("Snapshots"),
@@ -2550,6 +2661,8 @@ mod tests {
         assert!(tree.contains(
             "│   │       └── inspect - Inspect one manifest file from the current snapshot"
         ));
+        assert!(tree.contains("│   ├── name - Search table names"));
+        assert!(tree.contains("│   │   └── search - Search tables by table-name substring"));
         assert!(tree.contains("│   ├── partitions - Inspect table partitions"));
         assert!(tree.contains("│   ├── properties - Inspect table properties"));
         assert!(

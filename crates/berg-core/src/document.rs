@@ -137,6 +137,12 @@ impl Cell {
     pub fn value(value: DocumentValue) -> Self {
         Self::new(vec![value])
     }
+
+    /// Build an intentionally empty cell.
+    #[must_use]
+    pub fn blank() -> Self {
+        Self::new(vec![DocumentValue::Blank])
+    }
 }
 
 /// Fenced code block content.
@@ -273,6 +279,8 @@ pub enum Presence {
 /// Semantic inline value that renderers/frontends present in their own medium.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentValue {
+    /// Intentionally empty value.
+    Blank,
     /// Plain text.
     Text(String),
     /// Code-like text, such as field paths, type names, or identifiers.
@@ -289,6 +297,8 @@ pub enum DocumentValue {
     Unsigned(u64),
     /// Byte size value.
     Bytes(u64),
+    /// Byte size rendered in binary-size units only.
+    BinarySize(u64),
     /// Signed delta value.
     Delta {
         /// Delta sign/direction.

@@ -265,6 +265,36 @@ pub struct CurrentTableProperties {
     pub properties: Vec<TablePropertyEntry>,
 }
 
+/// Result of searching table names across a catalog prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableNameSearch {
+    /// Catalog prefix searched.
+    pub catalog_prefix: String,
+    /// Substring matched against table names.
+    pub table_name_substring: String,
+    /// Optional substring matched against dotted namespace names.
+    pub namespace_substring: Option<String>,
+    /// Whether matched tables were loaded for metadata details.
+    pub details_included: bool,
+    /// Matching table entries sorted by ID.
+    pub entries: Vec<TableNameSearchEntry>,
+}
+
+/// One table name search match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableNameSearchEntry {
+    /// Table ID as `namespace.table`.
+    pub id: String,
+    /// Table metadata update timestamp, present only when details are included.
+    pub updated_at: Option<OffsetDateTime>,
+    /// Number of snapshots retained in table metadata, present only when details are included.
+    pub snapshot_count: Option<usize>,
+    /// Current snapshot summary `total-records`, when present.
+    pub row_count: Option<u64>,
+    /// Current snapshot summary `total-files-size`, when present.
+    pub data_size_bytes: Option<u64>,
+}
+
 /// Current table schema plus table metadata identifiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentSchemaInfo {
@@ -796,6 +826,12 @@ impl RestCatalogConfig {
         )
     }
 
+    /// REST catalog prefix used for catalog requests.
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     fn catalog_properties(&self) -> HashMap<String, String> {
         let mut properties = self.properties.clone();
         properties.insert(REST_CATALOG_PROP_URI.to_string(), self.uri.clone());
@@ -881,6 +917,59 @@ pub async fn load_current_table_properties(
         default_partition_spec_id: metadata.default_partition_spec_id(),
         default_sort_order_id: metadata.default_sort_order_id(),
         properties,
+    })
+}
+
+/// Search table names across all namespaces in a REST catalog prefix.
+///
+/// When `include_details` is false, this only lists namespaces and tables. When
+/// true, it loads each matched table and uses only table metadata/current
+/// snapshot summary fields for details.
+///
+/// # Errors
+///
+/// Returns an Iceberg-backed error when the catalog cannot be constructed,
+/// contacted, listed, or when a matched table cannot be loaded for requested
+/// details. Returns [`BergError::InvalidTableMetadataTimestamp`] when detailed
+/// table metadata timestamps cannot be represented.
+pub async fn search_table_names(
+    config: &RestCatalogConfig,
+    table_name_substring: &str,
+    namespace_substring: Option<&str>,
+    include_details: bool,
+) -> Result<TableNameSearch> {
+    let catalog = load_rest_catalog(config).await?;
+    let namespaces = list_all_namespaces(&catalog).await?;
+    let mut entries = Vec::new();
+
+    for namespace in namespaces {
+        let namespace_name = namespace.to_string();
+        if namespace_substring.is_some_and(|substring| !namespace_name.contains(substring)) {
+            continue;
+        }
+
+        let tables = catalog.list_tables(&namespace).await?;
+        for table_ident in tables {
+            if !table_ident.name().contains(table_name_substring) {
+                continue;
+            }
+
+            entries.push(if include_details {
+                detailed_table_name_search_entry(config, &table_ident).await?
+            } else {
+                table_name_search_entry(&table_ident)
+            });
+        }
+    }
+
+    entries.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+
+    Ok(TableNameSearch {
+        catalog_prefix: config.prefix().to_string(),
+        table_name_substring: table_name_substring.to_string(),
+        namespace_substring: namespace_substring.map(str::to_string),
+        details_included: include_details,
+        entries,
     })
 }
 
@@ -3694,6 +3783,52 @@ async fn load_table(config: &RestCatalogConfig, table_ident: &TableIdent) -> Res
     let catalog = load_rest_catalog(config).await?;
 
     Ok(catalog.load_table(table_ident).await?)
+}
+
+async fn list_all_namespaces(catalog: &RestCatalog) -> Result<Vec<NamespaceIdent>> {
+    let mut pending = catalog.list_namespaces(None).await?;
+    let mut namespaces = Vec::new();
+
+    while let Some(namespace) = pending.pop() {
+        pending.extend(catalog.list_namespaces(Some(&namespace)).await?);
+        namespaces.push(namespace);
+    }
+
+    namespaces.sort_unstable();
+    namespaces.dedup();
+
+    Ok(namespaces)
+}
+
+fn table_name_search_entry(table_ident: &TableIdent) -> TableNameSearchEntry {
+    TableNameSearchEntry {
+        id: table_ident.to_string(),
+        updated_at: None,
+        snapshot_count: None,
+        row_count: None,
+        data_size_bytes: None,
+    }
+}
+
+async fn detailed_table_name_search_entry(
+    config: &RestCatalogConfig,
+    table_ident: &TableIdent,
+) -> Result<TableNameSearchEntry> {
+    let table = load_table(config, table_ident).await?;
+    let metadata = table.metadata();
+    let current_snapshot_summary = metadata
+        .current_snapshot()
+        .map(|snapshot| snapshot.summary());
+
+    Ok(TableNameSearchEntry {
+        id: table_ident.to_string(),
+        updated_at: Some(table_metadata_updated_at(metadata.last_updated_ms())?),
+        snapshot_count: Some(metadata.snapshots().len()),
+        row_count: current_snapshot_summary
+            .and_then(|summary| summary_u64(summary, SUMMARY_TOTAL_RECORDS)),
+        data_size_bytes: current_snapshot_summary
+            .and_then(|summary| summary_u64(summary, SUMMARY_TOTAL_FILE_SIZE)),
+    })
 }
 
 async fn load_rest_catalog(config: &RestCatalogConfig) -> Result<RestCatalog> {

@@ -94,6 +94,26 @@ Compute a metadata-derived maximum value:
 berg --catalog-uri http://localhost:8181 table data max current warehouse.db.table column_name
 ```
 
+Search table names across all namespaces in a catalog prefix:
+
+```sh
+berg --catalog-uri http://localhost:8181 table name search warehouse events
+```
+
+Limit table name search results to namespaces containing a substring:
+
+```sh
+berg --catalog-uri http://localhost:8181 table name search warehouse events analytics
+```
+
+Pass `--details` to load matched tables and include metadata-only details from
+the table metadata and current snapshot summary. This does not read manifests or
+data files:
+
+```sh
+berg --catalog-uri http://localhost:8181 table name search --details warehouse events
+```
+
 Use `--help` on any command for its arguments:
 
 ```sh
@@ -179,6 +199,7 @@ berg
 ├── table data max current
 ├── table manifest files list
 ├── table manifest files inspect
+├── table name search
 ├── table partitions current
 ├── table properties current
 ├── table schema compare

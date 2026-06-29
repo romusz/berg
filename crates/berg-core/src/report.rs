@@ -28,8 +28,8 @@ use crate::engine::{
     CurrentTablePartitions, CurrentTableProperties, CurrentTableStats, DataFileSizeBucketStats,
     DataFileSizeDistribution, DeleteAnalysisCompleteness, DeleteImpact,
     ManifestColumnMetadataSummary, ManifestFileListEntry, ManifestPartitionMetadataSummary,
-    MaxConfidence, ReadCompleteness, TablePropertyEntry, TableSnapshotList, TableSnapshotListEntry,
-    TypeCompatibility,
+    MaxConfidence, ReadCompleteness, TableNameSearch, TableNameSearchEntry, TablePropertyEntry,
+    TableSnapshotList, TableSnapshotListEntry, TypeCompatibility,
 };
 use crate::spec::{ManifestFile, NestedFieldRef, PartitionSpec, Schema, Type};
 use time::OffsetDateTime;
@@ -208,6 +208,18 @@ pub fn table_snapshot_list_document(
                 title: Cell::text("Snapshots"),
                 blocks: table_snapshot_list_blocks(snapshots),
             }),
+        ],
+    }
+}
+
+/// Build a document from a table name search result.
+#[must_use]
+pub fn table_name_search_document(search: &TableNameSearch) -> Document {
+    Document {
+        title: Cell::text("Table Name Search"),
+        blocks: vec![
+            Block::Properties(table_name_search_header_properties(search)),
+            Block::Table(table_name_search_table(search)),
         ],
     }
 }
@@ -1775,6 +1787,88 @@ fn table_snapshot_list_header_properties(
     ]
 }
 
+fn table_name_search_table(search: &TableNameSearch) -> Table {
+    let columns = if search.details_included {
+        vec![
+            Cell::text("ID"),
+            Cell::text("Updated At"),
+            Cell::text("Snapshot Count"),
+            Cell::text("Row Count"),
+            Cell::text("Data Size"),
+        ]
+    } else {
+        vec![Cell::text("ID")]
+    };
+
+    Table {
+        columns,
+        rows: search
+            .entries
+            .iter()
+            .map(|entry| table_name_search_row(entry, search.details_included))
+            .collect(),
+    }
+}
+
+fn table_name_search_header_properties(search: &TableNameSearch) -> Vec<Property> {
+    vec![
+        Property {
+            label: "Catalog prefix".to_string(),
+            value: Cell::code(search.catalog_prefix.clone()),
+        },
+        Property {
+            label: "Namespace substring".to_string(),
+            value: search
+                .namespace_substring
+                .as_ref()
+                .map_or_else(Cell::blank, |value| Cell::code(value.clone())),
+        },
+        Property {
+            label: "Table substring".to_string(),
+            value: Cell::code(search.table_name_substring.clone()),
+        },
+        Property {
+            label: "Matches".to_string(),
+            value: Cell::value(DocumentValue::Count(search.entries.len())),
+        },
+    ]
+}
+
+fn table_name_search_row(entry: &TableNameSearchEntry, include_details: bool) -> Row {
+    let mut cells = vec![Cell::code(entry.id.clone())];
+
+    if include_details {
+        cells.extend([
+            optional_timestamp_or_blank_cell(entry.updated_at),
+            entry.snapshot_count.map_or_else(Cell::blank, |value| {
+                Cell::value(DocumentValue::Count(value))
+            }),
+            optional_u64_or_blank_cell(entry.row_count),
+            optional_binary_size_or_blank_cell(entry.data_size_bytes),
+        ]);
+    }
+
+    Row { cells }
+}
+
+fn optional_timestamp_or_blank_cell(value: Option<OffsetDateTime>) -> Cell {
+    value.map_or_else(Cell::blank, |value| {
+        Cell::value(DocumentValue::Timestamp(value))
+    })
+}
+
+fn optional_u64_or_blank_cell(value: Option<u64>) -> Cell {
+    value.map_or_else(Cell::blank, |value| {
+        Cell::value(DocumentValue::Unsigned(value))
+    })
+}
+
+fn optional_binary_size_or_blank_cell(value: Option<u64>) -> Cell {
+    value.map_or_else(Cell::blank, |value| {
+        Cell::value(DocumentValue::BinarySize(value))
+    })
+}
+
 fn table_snapshot_list_blocks(snapshots: &TableSnapshotList) -> Vec<Block> {
     if snapshots.snapshots.is_empty() {
         return vec![Block::Paragraph(Cell::text("No snapshots found."))];
@@ -2176,8 +2270,8 @@ mod tests {
         CurrentTableStats, DataFileSizeBucketStats, DataFileSizeDistribution,
         DeleteAnalysisCompleteness, DeleteImpact, ManifestColumnMetadataSummary,
         ManifestFileListEntry, ManifestPartitionMetadataSummary, MaxConfidence,
-        PartitionMetricDistribution, ReadCompleteness, TablePropertyEntry, TableSnapshotList,
-        TableSnapshotListEntry, TypeCompatibility,
+        PartitionMetricDistribution, ReadCompleteness, TableNameSearch, TableNameSearchEntry,
+        TablePropertyEntry, TableSnapshotList, TableSnapshotListEntry, TypeCompatibility,
     };
     use crate::spec::{
         FormatVersion, ListType, ManifestContentType, ManifestFile, MapType, NestedField,
@@ -2186,10 +2280,11 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{
-        Block, Cell, DocumentValue, PrecisionStatus, Presence, Status,
+        Block, Cell, DocumentValue, PrecisionStatus, Presence, Property, Status,
         data_file_size_stats_document, manifest_file_detail_document, manifest_file_list_document,
-        schema_document, table_data_max_document, table_partitions_document,
-        table_properties_document, table_snapshot_list_document, table_stats_document,
+        schema_document, table_data_max_document, table_name_search_document,
+        table_partitions_document, table_properties_document, table_snapshot_list_document,
+        table_stats_document,
     };
 
     fn nested_schema() -> Schema {
@@ -2284,6 +2379,106 @@ mod tests {
 
     fn string_field(id: i32, name: &'static str) -> NestedFieldRef {
         NestedField::optional(id, name, Type::Primitive(PrimitiveType::String)).into()
+    }
+
+    #[test]
+    fn builds_table_name_search_document_without_details() {
+        let search = TableNameSearch {
+            catalog_prefix: "warehouse".to_string(),
+            table_name_substring: "event".to_string(),
+            namespace_substring: None,
+            details_included: false,
+            entries: vec![table_name_search_entry("analytics.events")],
+        };
+
+        let document = table_name_search_document(&search);
+
+        assert_eq!(Cell::text("Table Name Search"), document.title);
+        let [Block::Properties(properties), Block::Table(table)] = document.blocks.as_slice()
+        else {
+            panic!("expected search properties and table blocks");
+        };
+        assert_eq!(
+            vec![
+                Property {
+                    label: "Catalog prefix".to_string(),
+                    value: Cell::code("warehouse"),
+                },
+                Property {
+                    label: "Namespace substring".to_string(),
+                    value: Cell::blank(),
+                },
+                Property {
+                    label: "Table substring".to_string(),
+                    value: Cell::code("event"),
+                },
+                Property {
+                    label: "Matches".to_string(),
+                    value: Cell::value(DocumentValue::Count(1)),
+                },
+            ],
+            *properties
+        );
+        assert_eq!(vec![Cell::text("ID")], table.columns);
+        assert_eq!(1, table.rows.len());
+        assert_eq!(vec![Cell::code("analytics.events")], table.rows[0].cells);
+    }
+
+    #[test]
+    fn builds_table_name_search_document_with_details() {
+        let updated_at =
+            OffsetDateTime::from_unix_timestamp(1_777_999_300).expect("valid timestamp");
+        let search = TableNameSearch {
+            catalog_prefix: "warehouse".to_string(),
+            table_name_substring: "event".to_string(),
+            namespace_substring: Some("analytics".to_string()),
+            details_included: true,
+            entries: vec![TableNameSearchEntry {
+                id: "analytics.events".to_string(),
+                updated_at: Some(updated_at),
+                snapshot_count: Some(3),
+                row_count: None,
+                data_size_bytes: Some(42 * 1024 * 1024),
+            }],
+        };
+
+        let document = table_name_search_document(&search);
+
+        let [Block::Properties(properties), Block::Table(table)] = document.blocks.as_slice()
+        else {
+            panic!("expected search properties and table blocks");
+        };
+        assert_eq!(Cell::code("analytics"), properties[1].value);
+        assert_eq!(
+            vec![
+                Cell::text("ID"),
+                Cell::text("Updated At"),
+                Cell::text("Snapshot Count"),
+                Cell::text("Row Count"),
+                Cell::text("Data Size"),
+            ],
+            table.columns
+        );
+        assert_eq!(
+            vec![
+                Cell::code("analytics.events"),
+                Cell::value(DocumentValue::Timestamp(updated_at)),
+                Cell::value(DocumentValue::Count(3)),
+                Cell::blank(),
+                Cell::value(DocumentValue::BinarySize(42 * 1024 * 1024)),
+            ],
+            table.rows[0].cells
+        );
+    }
+
+    fn table_name_search_entry(id: &str) -> TableNameSearchEntry {
+        TableNameSearchEntry {
+            id: id.to_string(),
+            updated_at: None,
+            snapshot_count: None,
+            row_count: None,
+            data_size_bytes: None,
+        }
     }
 
     #[test]
